@@ -881,6 +881,25 @@ def write_translator(
     extra_variants: list[tuple[dict[int, int], dict[int, int]]],
 ) -> tuple[int, int, int]:
     arm, thumb = reachable_instructions(image, base, entry, instruction_limit)
+    overlay_exits: set[tuple[int, bool]] = set()
+    for extra_arm, extra_thumb in extra_variants:
+        for pc, word in extra_arm.items():
+            if word & 0xFE000000 == 0xFA000000:  # BLX immediate enters the main image in Thumb state.
+                offset = sign_extend(((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26)
+                target = (pc + 8 + offset) & 0xFFFFFFFF
+                if target not in extra_thumb:
+                    overlay_exits.add((target, True))
+                continue
+            for target in arm_successors(pc, word):
+                if target not in extra_arm:
+                    overlay_exits.add((target, False))
+    for target, is_thumb in overlay_exits:
+        if base <= target < base + len(image):
+            found_arm, found_thumb = reachable_instructions(
+                image, base, target, instruction_limit, is_thumb
+            )
+            arm.update(found_arm)
+            thumb.update(found_thumb)
     aliases: dict[int, dict[int, int]] = {}
     thumb_aliases: dict[int, set[int]] = {}
     for copy in copies:
