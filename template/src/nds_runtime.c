@@ -873,13 +873,19 @@ uint32_t nds_read32(const NdsCpu *cpu, uint32_t address) {
     if (address == REG_CARDDATA) {
         NdsCpu *mutable = (NdsCpu *)cpu;
         uint32_t value = UINT32_C(0xffffffff);
-        if (mutable->rom_file != NULL && mutable->card_remaining != 0) {
-            FILE *rom = mutable->rom_file;
-            uint8_t bytes[4] = {0xff, 0xff, 0xff, 0xff};
-            if (fseek(rom, (long)mutable->card_address, SEEK_SET) == 0)
-                (void)fread(bytes, 1, sizeof(bytes), rom);
-            value = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-                    ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+        if (mutable->card_remaining != 0) {
+            const uint8_t *command = mapped_const(mutable, REG_CARDCMD);
+            if (command != NULL && command[0] == 0xb8u) {
+                const uint32_t megabytes = NDS_ROM_SIZE >> 20;
+                value = UINT32_C(0x000000c2) | ((megabytes - 1u) << 8);
+            } else if (command != NULL && command[0] == 0xb7u && mutable->rom_file != NULL) {
+                FILE *rom = mutable->rom_file;
+                uint8_t bytes[4] = {0xff, 0xff, 0xff, 0xff};
+                if (fseek(rom, (long)mutable->card_address, SEEK_SET) == 0)
+                    (void)fread(bytes, 1, sizeof(bytes), rom);
+                value = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+                        ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+            }
             const uint32_t consumed = mutable->card_remaining < 4u ? mutable->card_remaining : 4u;
             mutable->card_address += consumed;
             mutable->card_remaining -= consumed;
@@ -1093,12 +1099,14 @@ void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value) {
     nds_write16(cpu, aligned + 2u, (uint16_t)(value >> 16));
     if (aligned == REG_ROMCTRL && value & UINT32_C(0x80000000)) {
         const uint8_t *command = mapped_const(cpu, REG_CARDCMD);
-        if (command != NULL && command[0] == 0xb7u) {
-            cpu->card_address = ((uint32_t)command[1] << 24) |
-                                ((uint32_t)command[2] << 16) |
-                                ((uint32_t)command[3] << 8) | command[4];
+        if (command != NULL) {
             const unsigned block = (value >> 24) & 7u;
             cpu->card_remaining = block == 7u ? 4u : (block == 0u ? 0u : 256u << block);
+            if (command[0] == 0xb7u) {
+                cpu->card_address = ((uint32_t)command[1] << 24) |
+                                    ((uint32_t)command[2] << 16) |
+                                    ((uint32_t)command[3] << 8) | command[4];
+            }
             uint8_t *control = mapped(cpu, REG_ROMCTRL);
             if (control != NULL) {
                 if (cpu->card_remaining != 0)

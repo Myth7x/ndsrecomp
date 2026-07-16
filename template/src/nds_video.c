@@ -83,9 +83,7 @@ static void render_engine(const NdsCpu *cpu, unsigned engine, int screen_y) {
     const unsigned display_mode = (display >> 16) & 3u;
     const uint16_t backdrop = nds_read16(cpu, PALETTE_BASE + engine * 0x400u);
     const int base_color = display_mode == 0u ? 0x7fffu : backdrop;
-    for (int y = 0; y < 192; ++y)
-        for (int x = 0; x < 256; ++x)
-            glPutPixel(x, screen_y + y, base_color);
+    glBoxFilled(0, screen_y, 255, screen_y + 191, base_color);
     if (display_mode != 1u)
         return;
 

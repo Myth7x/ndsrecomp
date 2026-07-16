@@ -6,8 +6,8 @@ and native build trees all stay below `output/`.
 
 The current milestone emits working Linux x86-64 ELF and Windows x86-64 EXE
 diagnostic runtimes. It translates reachable ARM/Thumb code for both DS CPUs,
-decodes dynamically loaded code at runtime, and renders through a small host
-easyGL2D-compatible layer backed by SDL3 with a live input HUD. It is not yet a
+includes statically discovered overlay variants, and renders through a small host
+easyGL2D-compatible layer backed by SDL3 with a live debug HUD. It is not yet a
 complete DS hardware runtime, so arbitrary retail games do not reach gameplay
 yet.
 
@@ -18,14 +18,14 @@ access for CMake to fetch the pinned SDL3 source when SDL3 is not installed.
 
 ```sh
 # Inspect any structurally valid .nds ROM.
-python3 tools/ndsrecomp.py inspect game.nds
+python3 ndsrecomp.py inspect game.nds
 
 # Generate and compile a Linux ELF under output/game/native/.
 make ROM=game.nds native-linux
 output/game/native/build-linux/ndsrecomp --self-test
 
 # Generate isolated projects for every ROM matched by the shell.
-python3 tools/ndsrecomp.py create ROMS/*.nds
+python3 ndsrecomp.py create ROMS/*.nds
 
 # Cross-compile a Windows EXE (requires MinGW-w64).
 make ROM=game.nds native-windows
@@ -43,8 +43,9 @@ generated in one pass. To compile each generated Linux project as well:
 for rom in ROMS/*.nds; do make ROM="$rom" native-linux; done
 ```
 
-The native window shows the DS button-to-key mapping and live input state in a
-sidebar. Use the mouse on the lower screen for touch. Keyboard controls are
+The native window shows the DS button-to-key mapping, touch state, frame timing,
+CPU throughput/PCs, and display-register state in a two-column debug sidebar.
+Use the mouse on the lower screen for touch. Keyboard controls are
 X/Z for A/B, S/A for X/Y, Q/W for L/R, Enter/Backspace for Start/Select, and
 the arrow keys for the D-pad.
 
@@ -69,10 +70,11 @@ Implemented today:
   jump/function tables, SDK autoload relocation, and mixed-mode calls;
 - concurrent ARM9/ARM7 execution, ARM banked SP/LR, exception returns, BIOS
   services, interrupts, timers, VBlank, IPC, and cartridge reads;
+- persistent EEPROM/flash save files stored beside each packaged ROM;
 - 16 MiB main RAM, ITCM/DTCM, ARM7 WRAM, palette, VRAM, OAM, basic I/O, and
   synchronous DMA;
 - two stacked 256x192 software screens presented through SDL3, with keyboard,
-  mouse touch input, and a live input HUD;
+  mouse touch input, frame pacing, and a live input/performance/render HUD;
 - reproducible Linux ELF and MinGW-w64 Windows EXE builds.
 
 Still required before the “any ROM runs” goal is reached: complete overlay and

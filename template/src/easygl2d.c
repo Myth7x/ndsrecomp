@@ -14,6 +14,7 @@ static uint16_t extkeyin = 0x007fu;
 static bool touch_down;
 static uint16_t touch_x;
 static uint16_t touch_y;
+static EasyGL2DStats stats;
 
 static bool button_down(uint16_t value, unsigned bit) {
     return (value & (uint16_t)(1u << bit)) == 0;
@@ -81,6 +82,48 @@ static void render_hud(void) {
     SDL_SetRenderDrawColor(renderer, 209, 218, 229, 255);
     SDL_RenderDebugTextFormat(renderer, 268.0f, 362.0f, "X %3u  Y %3u",
                               (unsigned)touch_x, (unsigned)touch_y);
+
+    SDL_SetRenderDrawColor(renderer, 52, 62, 76, 255);
+    SDL_RenderLine(renderer, 416.0f, 8.0f, 416.0f, 376.0f);
+    SDL_SetRenderDrawColor(renderer, 89, 221, 255, 255);
+    SDL_RenderDebugText(renderer, 428.0f, 10.0f, "DEBUG HUD");
+    SDL_SetRenderDrawColor(renderer, stats.running ? 51 : 239,
+                           stats.running ? 209 : 93,
+                           stats.running ? 122 : 112, 255);
+    SDL_RenderDebugText(renderer, 520.0f, 10.0f,
+                        stats.running ? "RUN" : "TRAP");
+    SDL_SetRenderDrawColor(renderer, 209, 218, 229, 255);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 30.0f, "FPS       %6.1f", stats.fps);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 44.0f, "FRAME     %6.2f MS", stats.frame_ms);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 58.0f, "EMU       %6.2f MS", stats.emulation_ms);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 72.0f, "VIDEO     %6.2f MS", stats.video_ms);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 86.0f, "PRESENT   %6.2f MS", stats.present_ms);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 100.0f, "HOST LOAD %6.1f %%", stats.host_load);
+
+    SDL_SetRenderDrawColor(renderer, 52, 62, 76, 255);
+    SDL_RenderLine(renderer, 424.0f, 122.0f, 568.0f, 122.0f);
+    SDL_SetRenderDrawColor(renderer, 89, 221, 255, 255);
+    SDL_RenderDebugText(renderer, 428.0f, 132.0f, "CPU");
+    SDL_SetRenderDrawColor(renderer, 209, 218, 229, 255);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 150.0f, "ARM9      %6.1f MIPS", stats.arm9_mips);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 164.0f, "ARM7      %6.1f MIPS", stats.arm7_mips);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 182.0f, "PC9       %08X", stats.arm9_pc);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 196.0f, "PC7       %08X", stats.arm7_pc);
+
+    SDL_SetRenderDrawColor(renderer, 52, 62, 76, 255);
+    SDL_RenderLine(renderer, 424.0f, 218.0f, 568.0f, 218.0f);
+    SDL_SetRenderDrawColor(renderer, 89, 221, 255, 255);
+    SDL_RenderDebugText(renderer, 428.0f, 228.0f, "RENDER");
+    SDL_SetRenderDrawColor(renderer, 209, 218, 229, 255);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 246.0f, "DISP A    %08X", stats.display_a);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 260.0f, "DISP B    %08X", stats.display_b);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 274.0f, "MODE A/B  %u / %u",
+                              (stats.display_a >> 16) & 3u,
+                              (stats.display_b >> 16) & 3u);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 288.0f, "VCOUNT    %3u",
+                              (unsigned)stats.vcount);
+    SDL_RenderDebugTextFormat(renderer, 428.0f, 306.0f, "FRAME     %llu",
+                              (unsigned long long)stats.frame);
 }
 
 static void update_key(SDL_Keycode key, bool pressed) {
@@ -199,6 +242,11 @@ uint16_t easygl2d_touch_y(void) {
     return touch_y;
 }
 
+void easygl2d_set_stats(const EasyGL2DStats *value) {
+    if (value != NULL)
+        stats = *value;
+}
+
 void easygl2d_present(void) {
     if (is_headless || texture == NULL)
         return;
@@ -280,9 +328,16 @@ void glBox(int x1, int y1, int x2, int y2, int color) {
 void glBoxFilled(int x1, int y1, int x2, int y2, int color) {
     if (x1 > x2) { const int swap = x1; x1 = x2; x2 = swap; }
     if (y1 > y2) { const int swap = y1; y1 = y2; y2 = swap; }
+    if (x2 < 0 || y2 < 0 || x1 >= EASYGL2D_WIDTH || y1 >= EASYGL2D_HEIGHT)
+        return;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= EASYGL2D_WIDTH) x2 = EASYGL2D_WIDTH - 1;
+    if (y2 >= EASYGL2D_HEIGHT) y2 = EASYGL2D_HEIGHT - 1;
+    const uint32_t rgba = rgba15(color);
     for (int y = y1; y <= y2; ++y)
         for (int x = x1; x <= x2; ++x)
-            glPutPixel(x, y, color);
+            framebuffer[y * EASYGL2D_WIDTH + x] = rgba;
 }
 
 void glBoxFilledGradient(int x1, int y1, int x2, int y2,

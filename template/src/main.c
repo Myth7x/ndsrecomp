@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define NDS_FRAME_NS UINT64_C(16714286)
+
 static const char *result_name(NdsRunResult result) {
     switch (result) {
     case NDS_RUN_BUDGET_EXHAUSTED: return "budget exhausted";
@@ -22,26 +24,30 @@ static const char *result_name(NdsRunResult result) {
 
 static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
                       NdsRunResult *result, NdsRunResult *arm7_result) {
-    for (uint32_t step = 0; step < count; ++step) {
-        nds_tick(cpu, 2u);
-        nds_tick(arm7, 1u);
+    for (uint32_t step = 0; step < count;) {
+        uint32_t quantum = count - step;
+        if (quantum > 64u)
+            quantum = 64u;
+        step += quantum;
+        nds_tick(cpu, quantum * 2u);
+        nds_tick(arm7, quantum);
         if (cpu->wait_cycles != 0u) {
-            cpu->wait_cycles--;
+            cpu->wait_cycles = cpu->wait_cycles > quantum ? cpu->wait_cycles - quantum : 0u;
             nds_poll_interrupts(cpu);
         } else if (cpu->halted) {
             nds_poll_interrupts(cpu);
         } else {
-            *result = nds_run_arm9(cpu, 1u);
+            *result = nds_run_arm9(cpu, quantum);
             if (*result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
         }
         if (arm7->wait_cycles != 0u) {
-            arm7->wait_cycles--;
+            arm7->wait_cycles = arm7->wait_cycles > quantum ? arm7->wait_cycles - quantum : 0u;
             nds_poll_interrupts(arm7);
         } else if (arm7->halted) {
             nds_poll_interrupts(arm7);
         } else {
-            *arm7_result = nds_run_arm7(arm7, 1u);
+            *arm7_result = nds_run_arm7(arm7, quantum);
             if (*arm7_result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
         }
@@ -52,7 +58,7 @@ static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
 int main(int argc, char **argv) {
     bool self_test = false;
     const char *rom_path = NULL;
-    uint32_t step_limit = 10000000u;
+    uint32_t step_limit = 0u;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--self-test") == 0) {
             self_test = true;
@@ -71,6 +77,8 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    if (step_limit == 0u)
+        step_limit = self_test ? 10000000u : 560190u;
     char default_rom[4096];
     if (rom_path == NULL) {
         const char *slash = strrchr(argv[0], '/');
@@ -109,6 +117,14 @@ int main(int argc, char **argv) {
     NdsRunResult arm7_result = NDS_RUN_BUDGET_EXHAUSTED;
     bool running = run_steps(&cpu, &arm7, step_limit, &result, &arm7_result);
     nds_video_render(&cpu);
+    EasyGL2DStats stats = {0};
+    stats.running = running;
+    stats.arm9_pc = cpu.r[15];
+    stats.arm7_pc = arm7.r[15];
+    stats.display_a = nds_read32(&cpu, UINT32_C(0x04000000));
+    stats.display_b = nds_read32(&cpu, UINT32_C(0x04001000));
+    stats.vcount = nds_read16(&cpu, UINT32_C(0x04000006));
+    easygl2d_set_stats(&stats);
     easygl2d_present();
     printf("%s (%s): %u ARM9 instructions translated\n", NDS_GAME_CODE,
            NDS_ROM_TITLE, nds_arm9_translated_instruction_count);
@@ -201,7 +217,13 @@ int main(int argc, char **argv) {
         return hash == 0 ? 1 : 0;
     }
 
+    uint64_t previous_frame_start = SDL_GetTicksNS();
+    uint64_t frame_deadline = previous_frame_start + NDS_FRAME_NS;
+    double previous_present_ms = 0.0;
     while (running && easygl2d_poll()) {
+        const uint64_t frame_start = SDL_GetTicksNS();
+        const uint64_t arm9_before = cpu.instructions_executed;
+        const uint64_t arm7_before = arm7.instructions_executed;
         const uint16_t keys = easygl2d_keyinput();
         const uint16_t extended_keys = easygl2d_extkeyin();
         nds_set_touch(&cpu, easygl2d_touching(), easygl2d_touch_x(), easygl2d_touch_y());
@@ -211,8 +233,44 @@ int main(int argc, char **argv) {
         nds_write16(&cpu, UINT32_C(0x04000136), extended_keys);
         nds_write16(&arm7, UINT32_C(0x04000136), extended_keys);
         running = run_steps(&cpu, &arm7, 560190u, &result, &arm7_result);
+        const uint64_t emulation_end = SDL_GetTicksNS();
         nds_video_render(&cpu);
+        const uint64_t video_end = SDL_GetTicksNS();
+
+        const double frame_ms = (double)(frame_start - previous_frame_start) / 1000000.0;
+        const double emulation_ms = (double)(emulation_end - frame_start) / 1000000.0;
+        const double video_ms = (double)(video_end - emulation_end) / 1000000.0;
+        const double instant_fps = frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0;
+        stats.frame++;
+        stats.fps = stats.fps == 0.0 ? instant_fps : stats.fps * 0.9 + instant_fps * 0.1;
+        stats.frame_ms = frame_ms;
+        stats.emulation_ms = emulation_ms;
+        stats.video_ms = video_ms;
+        stats.present_ms = previous_present_ms;
+        stats.host_load = (emulation_ms + video_ms + previous_present_ms) *
+                          100000000.0 / (double)NDS_FRAME_NS;
+        stats.arm9_mips = emulation_ms > 0.0 ?
+            (double)(cpu.instructions_executed - arm9_before) / emulation_ms / 1000.0 : 0.0;
+        stats.arm7_mips = emulation_ms > 0.0 ?
+            (double)(arm7.instructions_executed - arm7_before) / emulation_ms / 1000.0 : 0.0;
+        stats.arm9_pc = cpu.r[15];
+        stats.arm7_pc = arm7.r[15];
+        stats.display_a = nds_read32(&cpu, UINT32_C(0x04000000));
+        stats.display_b = nds_read32(&cpu, UINT32_C(0x04001000));
+        stats.vcount = nds_read16(&cpu, UINT32_C(0x04000006));
+        stats.running = running;
+        easygl2d_set_stats(&stats);
+
+        const uint64_t present_start = SDL_GetTicksNS();
         easygl2d_present();
+        const uint64_t present_end = SDL_GetTicksNS();
+        previous_present_ms = (double)(present_end - present_start) / 1000000.0;
+        if (present_end < frame_deadline)
+            SDL_DelayPrecise(frame_deadline - present_end);
+        else if (present_end - frame_deadline > NDS_FRAME_NS)
+            frame_deadline = present_end;
+        frame_deadline += NDS_FRAME_NS;
+        previous_frame_start = frame_start;
     }
     nds_cpu_destroy(&arm7);
     nds_cpu_destroy(&cpu);

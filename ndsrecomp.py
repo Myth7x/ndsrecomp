@@ -740,9 +740,10 @@ def thumb_successors(image: bytes, base: int, pc: int, half: int) -> tuple[tuple
 
 
 def reachable_instructions(
-    image: bytes, base: int, entry: int, limit: int, entry_thumb: bool = False
+    image: bytes, base: int, entry: int, limit: int, entry_thumb: bool = False,
+    extra_entries: tuple[tuple[int, bool], ...] = (),
 ) -> tuple[dict[int, int], dict[int, int]]:
-    pending = deque([(entry, entry_thumb)])
+    pending = deque(((entry, entry_thumb), *extra_entries))
     arm: dict[int, int] = {}
     thumb: dict[int, int] = {}
     while pending and (limit == 0 or len(arm) + len(thumb) < limit):
@@ -895,17 +896,20 @@ def write_translator(
                 target = (pc + 8 + offset) & 0xFFFFFFFF
                 if target not in extra_thumb:
                     overlay_exits.add((target, True))
-                continue
-            for target in arm_successors(pc, word):
+            elif word & 0x0E000000 == 0x0A000000:
+                target = (pc + 8 + sign_extend(word & 0xFFFFFF, 24) * 4) & 0xFFFFFFFF
                 if target not in extra_arm:
                     overlay_exits.add((target, False))
-    for target, is_thumb in overlay_exits:
-        if base <= target < base + len(image):
-            found_arm, found_thumb = reachable_instructions(
-                image, base, target, instruction_limit, is_thumb
-            )
-            arm.update(found_arm)
-            thumb.update(found_thumb)
+    overlay_exits = {
+        root for root in overlay_exits if base <= root[0] < base + len(image)
+    }
+    if overlay_exits:
+        first, *rest = overlay_exits
+        found_arm, found_thumb = reachable_instructions(
+            image, base, first[0], instruction_limit, first[1], tuple(rest)
+        )
+        arm.update(found_arm)
+        thumb.update(found_thumb)
     aliases: dict[int, dict[int, int]] = {}
     thumb_aliases: dict[int, set[int]] = {}
     for copy in copies:
@@ -923,6 +927,28 @@ def write_translator(
             aliases.setdefault(pc, {})[word] = pc
         for pc, half in extra_thumb.items():
             thumb_aliases.setdefault(pc, set()).add(half)
+    alias_exits: set[tuple[int, bool]] = set()
+    for pc, variants in aliases.items():
+        for word in variants:
+            if word & 0xFE000000 == 0xFA000000:
+                offset = sign_extend(((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26)
+                target = (pc + 8 + offset) & 0xFFFFFFFF
+                if target not in thumb_aliases:
+                    alias_exits.add((target, True))
+            elif word & 0x0E000000 == 0x0A000000:
+                target = (pc + 8 + sign_extend(word & 0xFFFFFF, 24) * 4) & 0xFFFFFFFF
+                if target not in aliases:
+                    alias_exits.add((target, False))
+    alias_exits = {
+        root for root in alias_exits if base <= root[0] < base + len(image)
+    }
+    if alias_exits:
+        first, *rest = alias_exits
+        found_arm, found_thumb = reachable_instructions(
+            image, base, first[0], instruction_limit, first[1], tuple(rest)
+        )
+        arm.update(found_arm)
+        thumb.update(found_thumb)
     for pc in set(arm) & set(aliases):
         aliases[pc][arm.pop(pc)] = pc
     for pc in set(thumb) & set(thumb_aliases):
@@ -1046,13 +1072,14 @@ def write_translator(
     )
     if not ranges["thumb"]:
         lines.append("            (void)half;")
-    for function, first, last in ranges["thumb"]:
-        lines.append(f"            if (pc >= 0x{first:08x}u && pc <= 0x{last:08x}u)")
-        lines.append(f"                result = {function}(cpu, pc, half);")
-    lines.extend(("        } else {", "            const uint32_t word = nds_read32(cpu, pc);"))
-    for function, first, last in ranges["arm"]:
-        lines.append(f"            if (pc >= 0x{first:08x}u && pc <= 0x{last:08x}u)")
-        lines.append(f"                result = {function}(cpu, pc, word);")
+    lines.append("            switch (pc >> 12) {")
+    for function, first, _ in ranges["thumb"]:
+        lines.append(f"            case 0x{first >> 12:05x}u: result = {function}(cpu, pc, half); break;")
+    lines.extend(("            }", "        } else {", "            const uint32_t word = nds_read32(cpu, pc);",
+                  "            switch (pc >> 12) {"))
+    for function, first, _ in ranges["arm"]:
+        lines.append(f"            case 0x{first >> 12:05x}u: result = {function}(cpu, pc, word); break;")
+    lines.append("            }")
     lines.extend(
         (
             "        }",
@@ -1082,6 +1109,7 @@ def write_config_header(output: Path, info: RomInfo, compressed: bool, expanded_
                 f'#define NDS_ROM_TITLE "{safe_title}"',
                 f'#define NDS_GAME_CODE "{info.game_code}"',
                 f"#define NDS_UNIT_CODE {info.unit_code}u",
+                f"#define NDS_ROM_SIZE 0x{info.rom_size:08x}u",
                 f"#define NDS_ARM9_ROM_OFFSET 0x{info.arm9.rom_offset:08x}u",
                 f"#define NDS_ARM9_ENTRY 0x{info.arm9.entry_address:08x}u",
                 f"#define NDS_ARM9_RAM_ADDRESS 0x{info.arm9.ram_address:08x}u",
