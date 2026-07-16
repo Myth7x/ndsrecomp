@@ -648,7 +648,9 @@ def add_address_taken_functions(
     arm: dict[int, int], thumb: dict[int, int], image: bytes, base: int
 ) -> int:
     before = len(arm) + len(thumb)
-    for root in find_function_roots(image, base):
+    roots = deque(find_function_roots(image, base))
+    while roots:
+        root = roots.popleft()
         pending = deque([root])
         added = 0
         while pending and added < 256:
@@ -671,13 +673,17 @@ def add_address_taken_functions(
                 added += 1
                 if word & 0xFE000000 == 0xFA000000:
                     offset = sign_extend(((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26)
+                    target = (pc + 8 + offset) & 0xFFFFFFFF
                     pending.append((pc + 4, False))
-                    pending.append(((pc + 8 + offset) & 0xFFFFFFFF, True))
+                    pending.append((target, True))
+                    roots.append((target, True))
                 else:
                     pending.extend(arm_function_table_targets(image, base, pc, word))
                     successors = arm_successors(pc, word) + arm_jump_table_targets(
                         image, base, pc, word
                     )
+                    if word & 0x0F000000 == 0x0B000000:
+                        roots.append((successors[-1], False))
                     if (word & 0x0FFFFFF0 == 0x012FFF10 and
                             image_word(image, base, pc - 4) == 0xE1A0E00F):
                         successors += (pc + 4,)
