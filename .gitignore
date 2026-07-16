@@ -1,0 +1,12 @@
+/ROMS/
+/baserom.nds
+/baserom.*.nds
+/.tools/
+/build/
+/output/
+/extract/
+/ghidra/
+/*.elf
+/*.lst
+/*.map
+/*.nds

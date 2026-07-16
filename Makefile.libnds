@@ -1,0 +1,51 @@
+ifeq ($(strip $(DEVKITARM)),)
+$(error DEVKITARM is not set; use the top-level Makefile)
+endif
+
+GAME_TITLE := ndsrecomp
+GAME_SUBTITLE1 := libnds replacement build
+GAME_SUBTITLE2 := NDS recompilation research
+TARGET := ndsrecomp
+OUTPUT_DIR ?= $(CURDIR)/output/baserom/ds
+OUTPUT := $(OUTPUT_DIR)/$(TARGET)
+LIBPATHS := -L$(DEVKITPRO)/libnds/lib
+
+include $(DEVKITARM)/ds_rules
+
+BUILD := $(OUTPUT_DIR)/build
+SOURCES := source
+ARCH := -march=armv5te -mtune=arm946e-s
+
+CFLAGS := -g -Wall -Wextra -O2 -ffunction-sections -fdata-sections $(ARCH) -DARM9
+LDFLAGS := -specs=ds_arm9.specs -g $(ARCH) -Wl,-Map,$(OUTPUT).map
+LIBS := -lnds9
+CPPFLAGS := -I$(CURDIR)/include -I$(LIBNDS)/include -I$(BUILD)
+
+CFILES := $(notdir $(wildcard $(SOURCES)/*.c))
+OFILES := $(addprefix $(BUILD)/,$(CFILES:.c=.o))
+DEPSDIR := $(BUILD)
+LD := $(CC)
+VPATH := $(SOURCES)
+
+.PHONY: all clean
+
+all: $(OUTPUT).nds
+
+$(OUTPUT).nds: $(OUTPUT).elf
+
+$(OUTPUT).elf: $(OFILES) | $(OUTPUT_DIR)
+	@echo linking $(notdir $@)
+	@$(LD) $(LIBPATHS) $(_LDFLAGS) $(OFILES) $(LIBS) $(_EXTRALIBS) -o $@
+	@$(NM) -CSn $@ > $(OUTPUT).lst
+
+$(BUILD) $(OUTPUT_DIR):
+	mkdir -p $@
+
+$(BUILD)/%.o: %.c | $(BUILD)
+	@echo $<
+	@$(CC) -MMD -MP -MF $(BUILD)/$*.d $(_EXTRADEFS) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf -- $(OUTPUT_DIR)
+
+-include $(BUILD)/*.d
