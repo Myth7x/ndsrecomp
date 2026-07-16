@@ -21,15 +21,17 @@ if(NOT TARGET SDL3::SDL3 AND NOT TARGET SDL3::SDL3-static)
   )
   FetchContent_MakeAvailable(SDL3)
 endif()
+find_package(OpenGL REQUIRED)
 
-file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS generated/*_recomp*.c)
+include(generated/recomp_sources.cmake)
 
 add_executable(ndsrecomp
   src/main.c
   src/easygl2d.c
+  src/nds_gpu.c
   src/nds_runtime.c
   src/nds_video.c
-  ${RECOMP_SOURCES}
+  ${NDSRECOMP_SOURCES}
   generated/rom_data.c
   generated/arm7_data.c
 )
@@ -40,14 +42,15 @@ if(TARGET SDL3::SDL3-static)
 else()
   target_link_libraries(ndsrecomp PRIVATE SDL3::SDL3)
 endif()
+target_link_libraries(ndsrecomp PRIVATE OpenGL::GL)
 if(NOT MSVC)
   target_link_libraries(ndsrecomp PRIVATE m)
 endif()
 
 if(MSVC)
   target_compile_options(ndsrecomp PRIVATE /W4)
-  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS /O2)
+  set_source_files_properties(${NDSRECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS /O2)
 else()
   target_compile_options(ndsrecomp PRIVATE -Wall -Wextra -Wpedantic)
-  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS -O2)
+  set_source_files_properties(${NDSRECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS -O2)
 endif()

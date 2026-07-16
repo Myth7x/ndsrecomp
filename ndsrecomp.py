@@ -459,7 +459,11 @@ def find_stack_trampoline_copies(
     """Find the SDK's two-word ARM trampoline copied onto the startup stack."""
     stop = min(base + len(image), start + 0x800)
     for pc in range(start + 4, stop - 36, 4):
-        source = literal_value(image, base, pc - 4, image_word(image, base, pc - 4), 1)
+        source_word = image_word(image, base, pc - 4)
+        source = (
+            literal_value(image, base, pc - 4, source_word, 1)
+            if source_word is not None else None
+        )
         words = [image_word(image, base, pc + index * 4) for index in range(10)]
         if source is None or words[:4] != [0xE4910004, 0xE50D0004, 0xE5910000, 0xE58D0000]:
             continue
@@ -604,7 +608,7 @@ def arm_function_table_targets(image: bytes, base: int, pc: int, word: int) -> t
     return tuple(targets)
 
 
-def plausible_function(image: bytes, base: int, target: int) -> bool:
+def plausible_function(image: bytes, base: int, target: int, tail: int = 32) -> bool:
     address = target & ~1
     if target & 1:
         half = image_half(image, base, address)
@@ -612,7 +616,7 @@ def plausible_function(image: bytes, base: int, target: int) -> bool:
             half & 0xFE00 == 0xB400 or half & 0xF800 == 0x4800 or half == 0x4770
         ):
             return True
-        return any(image_half(image, base, address + offset) == 0x4770 for offset in range(0, 32, 2))
+        return any(image_half(image, base, address + offset) == 0x4770 for offset in range(0, tail, 2))
     word = image_word(image, base, address)
     if word is not None and (
         word & 0xFFFF0000 == 0xE92D0000
@@ -620,20 +624,20 @@ def plausible_function(image: bytes, base: int, target: int) -> bool:
         or word == 0xE12FFF1E
     ):
         return True
-    return any(image_word(image, base, address + offset) == 0xE12FFF1E for offset in range(0, 32, 4))
+    return any(image_word(image, base, address + offset) == 0xE12FFF1E for offset in range(0, tail, 4))
 
 
-def find_function_roots(image: bytes, base: int) -> list[tuple[int, bool]]:
+def find_function_roots(image: bytes, base: int, tail: int = 32) -> list[tuple[int, bool]]:
     roots: set[tuple[int, bool]] = set()
     run: list[tuple[int, bool]] = []
     anchored = False
     for offset in range(0, len(image) - 3, 4):
         value = read_u32(image, offset)
         if base <= (value & ~1) < base + len(image):
-            if plausible_function(image, base, value):
+            if plausible_function(image, base, value, tail):
                 roots.add((value & ~1, bool(value & 1)))
             run.append((value & ~1, bool(value & 1)))
-            anchored = anchored or plausible_function(image, base, value)
+            anchored = anchored or plausible_function(image, base, value, tail)
         else:
             if len(run) >= 2 and anchored:
                 roots.update(run)
@@ -644,16 +648,35 @@ def find_function_roots(image: bytes, base: int) -> list[tuple[int, bool]]:
     return sorted(roots)
 
 
+def short_linear_arm_function(
+    image: bytes, base: int, entry: int, max_instructions: int = 16
+) -> dict[int, int] | None:
+    """Capture tiny overlay functions missed by the normal root heuristic."""
+    translated: dict[int, int] = {}
+    for index in range(max_instructions):
+        pc = entry + index * 4
+        word = image_word(image, base, pc)
+        if word is None:
+            return None
+        translated[pc] = word
+        if word == 0xE12FFF1E:  # BX LR
+            return translated
+        if (word & 0x0E000000 == 0x0A000000 or
+                word & 0x0FFFFFF0 in (0x012FFF10, 0x012FFF30)):
+            return None
+    return None
+
+
 def add_address_taken_functions(
-    arm: dict[int, int], thumb: dict[int, int], image: bytes, base: int
+    arm: dict[int, int], thumb: dict[int, int], image: bytes, base: int,
+    limit: int = 0,
 ) -> int:
     before = len(arm) + len(thumb)
     roots = deque(find_function_roots(image, base))
-    while roots:
+    while roots and (limit == 0 or len(arm) + len(thumb) < limit):
         root = roots.popleft()
         pending = deque([root])
-        added = 0
-        while pending and added < 256:
+        while pending and (limit == 0 or len(arm) + len(thumb) < limit):
             pc, is_thumb = pending.popleft()
             selected = thumb if is_thumb else arm
             if pc in selected:
@@ -663,14 +686,12 @@ def add_address_taken_functions(
                 if half is None:
                     continue
                 thumb[pc] = half
-                added += 1
                 pending.extend(thumb_successors(image, base, pc, half))
             else:
                 word = image_word(image, base, pc)
                 if word is None:
                     continue
                 arm[pc] = word
-                added += 1
                 if word & 0xFE000000 == 0xFA000000:
                     offset = sign_extend(((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26)
                     target = (pc + 8 + offset) & 0xFFFFFFFF
@@ -811,7 +832,7 @@ def reachable_instructions(
             successors += (pc + 4,)
         for successor in reversed(successors):
             pending.appendleft((successor, False))
-    add_address_taken_functions(arm, thumb, image, base)
+    add_address_taken_functions(arm, thumb, image, base, limit)
     return arm, thumb
 
 
@@ -874,6 +895,23 @@ def referenced_overlay_variants(
             overlay_arm.update(found_arm)
             overlay_thumb.update(found_thumb)
         variants.append((overlay_arm, overlay_thumb))
+
+    # Some games dispatch through function pointers in overlays loaded later,
+    # so no main-image branch can identify their overlay. Keep the fallback
+    # deliberately tiny: full root expansion for every overlay is enormous.
+    for overlay in overlays:
+        overlay_image = read_overlay_image(rom_path, overlay)
+        known_roots = set(find_function_roots(overlay_image, overlay.ram_address))
+        for target, is_thumb in find_function_roots(
+            overlay_image, overlay.ram_address, 64
+        ):
+            if is_thumb or (target, is_thumb) in known_roots:
+                continue
+            function = short_linear_arm_function(
+                overlay_image, overlay.ram_address, target
+            )
+            if function is not None:
+                variants.append((function, {}))
     return variants
 
 
@@ -903,10 +941,13 @@ def write_translator(
     overlay_exits = {
         root for root in overlay_exits if base <= root[0] < base + len(image)
     }
-    if overlay_exits:
+    remaining = (
+        instruction_limit - len(arm) - len(thumb) if instruction_limit else 0
+    )
+    if overlay_exits and (instruction_limit == 0 or remaining > 0):
         first, *rest = overlay_exits
         found_arm, found_thumb = reachable_instructions(
-            image, base, first[0], instruction_limit, first[1], tuple(rest)
+            image, base, first[0], remaining, first[1], tuple(rest)
         )
         arm.update(found_arm)
         thumb.update(found_thumb)
@@ -942,10 +983,13 @@ def write_translator(
     alias_exits = {
         root for root in alias_exits if base <= root[0] < base + len(image)
     }
-    if alias_exits:
+    remaining = (
+        instruction_limit - len(arm) - len(thumb) if instruction_limit else 0
+    )
+    if alias_exits and (instruction_limit == 0 or remaining > 0):
         first, *rest = alias_exits
         found_arm, found_thumb = reachable_instructions(
-            image, base, first[0], instruction_limit, first[1], tuple(rest)
+            image, base, first[0], remaining, first[1], tuple(rest)
         )
         arm.update(found_arm)
         thumb.update(found_thumb)
@@ -1201,6 +1245,16 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
         info.arm7.ram_address, info.arm7.entry_address, instruction_limit, arm7_copies,
         arm7_overlay_variants,
     )
+    recomp_sources = sorted(
+        path.relative_to(output).as_posix()
+        for path in generated.glob("*_recomp*.c")
+    )
+    write_text_if_changed(
+        generated / "recomp_sources.cmake",
+        "set(NDSRECOMP_SOURCES\n"
+        + "\n".join(f"    {source}" for source in recomp_sources)
+        + "\n)\n",
+    )
 
     manifest = {
         "format_version": 1,
@@ -1266,6 +1320,14 @@ def create_projects(
 
 
 def self_test() -> None:
+    limited_image = bytearray(0x20)
+    struct.pack_into("<2I", limited_image, 0, 0x1010, 0x1010)
+    struct.pack_into("<3I", limited_image, 8, 0xE12FFF1E, 0, 0xE92D4000)
+    limited_arm, limited_thumb = reachable_instructions(
+        bytes(limited_image), 0x1000, 0x1008, 1
+    )
+    assert len(limited_arm) + len(limited_thumb) == 1
+
     with tempfile.TemporaryDirectory(prefix="ndsrecomp-test-") as temp:
         root = Path(temp)
         rom = root / "test.nds"

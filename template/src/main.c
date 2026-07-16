@@ -26,8 +26,8 @@ static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
                       NdsRunResult *result, NdsRunResult *arm7_result) {
     for (uint32_t step = 0; step < count;) {
         uint32_t quantum = count - step;
-        if (quantum > 64u)
-            quantum = 64u;
+        if (quantum > 1u)
+            quantum = 1u;
         step += quantum;
         nds_tick(cpu, quantum * 2u);
         nds_tick(arm7, quantum);

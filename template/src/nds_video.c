@@ -103,6 +103,6 @@ static void render_engine(const NdsCpu *cpu, unsigned engine, int screen_y) {
 
 void nds_video_render(const NdsCpu *cpu) {
     const bool swap = (io16(cpu, 0x304u) & 0x8000u) != 0u;
-    render_engine(cpu, 0u, swap ? 192 : 0);
-    render_engine(cpu, 1u, swap ? 0 : 192);
+    render_engine(cpu, 0u, swap ? 0 : 192);
+    render_engine(cpu, 1u, swap ? 192 : 0);
 }

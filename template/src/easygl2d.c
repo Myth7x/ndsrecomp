@@ -1,6 +1,7 @@
 #include "easygl2d.h"
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +9,8 @@ static uint32_t framebuffer[EASYGL2D_WIDTH * EASYGL2D_HEIGHT];
 static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_Texture *texture;
+static SDL_Window *gl_window;
+static SDL_GLContext gl_context;
 static bool is_headless;
 static uint16_t keyinput = 0x03ffu;
 static uint16_t extkeyin = 0x007fu;
@@ -182,6 +185,9 @@ bool easygl2d_init(const char *title, int scale, bool headless) {
         return true;
     if (!SDL_Init(SDL_INIT_VIDEO))
         return false;
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 0);
     if (scale < 1)
         scale = 1;
     if (!SDL_CreateWindowAndRenderer(title, EASYGL2D_WINDOW_WIDTH * scale,
@@ -194,7 +200,34 @@ bool easygl2d_init(const char *title, int scale, bool headless) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
                                 SDL_TEXTUREACCESS_STREAMING,
                                 EASYGL2D_WIDTH, EASYGL2D_HEIGHT);
+    gl_window = SDL_CreateWindow(title, EASYGL2D_WIDTH, 192,
+                                 SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (gl_window != NULL)
+        gl_context = SDL_GL_CreateContext(gl_window);
     return texture != NULL;
+}
+
+bool easygl2d_gl_begin(void) {
+    return gl_window != NULL && gl_context != NULL &&
+           SDL_GL_MakeCurrent(gl_window, gl_context);
+}
+
+void easygl2d_gl_end(int screen_y) {
+    if (gl_window == NULL || gl_context == NULL)
+        return;
+    static uint8_t pixels[256u * 192u * 4u];
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    for (unsigned y = 0; y < 192u; ++y) {
+        const unsigned source_y = 191u - y;
+        for (unsigned x = 0; x < 256u; ++x) {
+            const uint8_t *source = pixels + (source_y * 256u + x) * 4u;
+            framebuffer[(screen_y + (int)y) * EASYGL2D_WIDTH + x] =
+                ((uint32_t)source[0] << 24) | ((uint32_t)source[1] << 16) |
+                ((uint32_t)source[2] << 8) | source[3];
+        }
+    }
+    SDL_GL_MakeCurrent(gl_window, NULL);
 }
 
 bool easygl2d_poll(void) {
@@ -260,10 +293,14 @@ void easygl2d_present(void) {
 }
 
 void easygl2d_shutdown(void) {
+    SDL_GL_DestroyContext(gl_context);
+    SDL_DestroyWindow(gl_window);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     texture = NULL;
+    gl_context = NULL;
+    gl_window = NULL;
     renderer = NULL;
     window = NULL;
     if (!is_headless)

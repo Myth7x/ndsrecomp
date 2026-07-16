@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef struct NdsGpuTag NdsGpu;
+
 typedef enum {
     NDS_RUN_BUDGET_EXHAUSTED,
     NDS_RUN_OUTSIDE_TRANSLATION,
@@ -21,6 +23,7 @@ typedef struct NdsCpuTag {
     uint32_t banked_spsr[32];
     uint32_t dtcm_base;
     uint32_t dtcm_control;
+    uint32_t cp15_control;
     uint32_t trap_pc;
     uint32_t trap_word;
     uint32_t last_pc;
@@ -67,6 +70,7 @@ typedef struct NdsCpuTag {
     bool owns_shared_memory;
     bool owns_save_memory;
     struct NdsCpuTag *peer;
+    NdsGpu *gpu;
     uint8_t *itcm;
     uint8_t *dtcm;
     uint8_t *main_ram;

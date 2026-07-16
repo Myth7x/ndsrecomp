@@ -47,6 +47,7 @@
 #define REG_TIMER0 UINT32_C(0x04000100)
 #define REG_KEYINPUT UINT32_C(0x04000130)
 #define REG_EXTKEYIN UINT32_C(0x04000136)
+#define REG_SOUNDBIAS UINT32_C(0x04000504)
 #define REG_SPICNT UINT32_C(0x040001c0)
 #define REG_SPIDATA UINT32_C(0x040001c2)
 #define REG_DIVCNT UINT32_C(0x04000280)
@@ -58,6 +59,9 @@
 #define REG_SQRTRESULT UINT32_C(0x040002b4)
 #define REG_SQRTPARAM UINT32_C(0x040002b8)
 #define DEFAULT_SAVE_SIZE (8u * 1024u)
+#define NDS_FRAME_CYCLES UINT32_C(560190)
+#define NDS_LINE_CYCLES UINT32_C(2130)
+#define NDS_HBLANK_CYCLES UINT32_C(1536)
 #define REG_IPCFIFORECV UINT32_C(0x04100000)
 #define REG_CARDDATA UINT32_C(0x04100010)
 #define IRQ_IPC_RECV (UINT32_C(1) << 18)
@@ -540,6 +544,29 @@ static bool initialize_direct_boot(NdsCpu *cpu) {
         return false;
     memcpy(cpu->main_ram + (UINT32_C(0x027ffe00) - MAIN_BASE), header, sizeof(header));
 
+    /* Match the header/cart values the firmware leaves in main RAM.  SDK
+       startup code uses these before it starts the game-specific boot. */
+    uint32_t cart_id = UINT32_C(0x000000c2);
+    if (NDS_ROM_SIZE >= UINT32_C(0x00100000) &&
+        NDS_ROM_SIZE <= UINT32_C(0x08000000))
+        cart_id |= ((NDS_ROM_SIZE >> 20) - 1u) << 8;
+    else if (NDS_ROM_SIZE < UINT32_C(0x10000000))
+        cart_id |= (UINT32_C(0x100) - (NDS_ROM_SIZE >> 28)) << 8;
+    if (NDS_UNIT_CODE != 0u)
+        cart_id |= UINT32_C(0x40000000);
+    uint16_t header_crc;
+    uint16_t secure_crc;
+    memcpy(&header_crc, header + 0x15e, sizeof(header_crc));
+    memcpy(&secure_crc, header + 0x06c, sizeof(secure_crc));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ff800) - MAIN_BASE), &cart_id, sizeof(cart_id));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ff804) - MAIN_BASE), &cart_id, sizeof(cart_id));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ff808) - MAIN_BASE), &header_crc, sizeof(header_crc));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ff80a) - MAIN_BASE), &secure_crc, sizeof(secure_crc));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ffc00) - MAIN_BASE), &cart_id, sizeof(cart_id));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ffc04) - MAIN_BASE), &cart_id, sizeof(cart_id));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ffc08) - MAIN_BASE), &header_crc, sizeof(header_crc));
+    memcpy(cpu->main_ram + (UINT32_C(0x027ffc0a) - MAIN_BASE), &secure_crc, sizeof(secure_crc));
+
     const uint16_t boot_indicator = 1u;
     const uint16_t gba_header = UINT16_C(0xffff);
     const uint16_t chip_type = UINT16_C(0x5835);
@@ -583,6 +610,7 @@ bool nds_cpu_init_arm9(NdsCpu *cpu, const char *rom_path) {
     cpu->cpu_id = 9u;
     cpu->dtcm_base = UINT32_C(0x03000000);
     cpu->dtcm_control = cpu->dtcm_base | 0xau;
+    cpu->cp15_control = UINT32_C(0x00052078);
     cpu->owns_shared_memory = true;
     cpu->itcm = calloc(1, ITCM_SIZE);
     cpu->dtcm = calloc(1, DTCM_SIZE);
@@ -620,6 +648,12 @@ bool nds_cpu_init_arm9(NdsCpu *cpu, const char *rom_path) {
     const uint16_t extended_keys_released = UINT16_C(0x007f);
     memcpy(cpu->io + (UINT32_C(0x04000204) - IO_BASE), &exmemcnt, sizeof(exmemcnt));
     memcpy(cpu->io + (UINT32_C(0x04000304) - IO_BASE), &power, sizeof(power));
+    const uint32_t rom_control = UINT32_C(0x20000000);
+    const uint16_t aux_spi_control = UINT16_C(0x8000);
+    const uint16_t sound_bias = UINT16_C(0x0200);
+    memcpy(cpu->io + (REG_ROMCTRL - IO_BASE), &rom_control, sizeof(rom_control));
+    memcpy(cpu->io + (REG_AUXSPICNT - IO_BASE), &aux_spi_control, sizeof(aux_spi_control));
+    memcpy(cpu->io + (REG_SOUNDBIAS - IO_BASE), &sound_bias, sizeof(sound_bias));
     memcpy(cpu->io + (REG_KEYINPUT - IO_BASE), &keys_released, sizeof(keys_released));
     memcpy(cpu->io + (REG_EXTKEYIN - IO_BASE), &extended_keys_released,
            sizeof(extended_keys_released));
@@ -663,8 +697,14 @@ bool nds_cpu_init_arm7(NdsCpu *cpu, NdsCpu *arm9) {
     const uint16_t power = 1u;
     const uint16_t keys_released = UINT16_C(0x03ff);
     const uint16_t extended_keys_released = UINT16_C(0x007f);
+    const uint32_t rom_control = UINT32_C(0x20000000);
+    const uint16_t aux_spi_control = UINT16_C(0x8000);
+    const uint16_t sound_bias = UINT16_C(0x0200);
     memcpy(cpu->io + (UINT32_C(0x04000204) - IO_BASE), &exmemstat, sizeof(exmemstat));
     memcpy(cpu->io + (UINT32_C(0x04000304) - IO_BASE), &power, sizeof(power));
+    memcpy(cpu->io + (REG_ROMCTRL - IO_BASE), &rom_control, sizeof(rom_control));
+    memcpy(cpu->io + (REG_AUXSPICNT - IO_BASE), &aux_spi_control, sizeof(aux_spi_control));
+    memcpy(cpu->io + (REG_SOUNDBIAS - IO_BASE), &sound_bias, sizeof(sound_bias));
     memcpy(cpu->io + (REG_KEYINPUT - IO_BASE), &keys_released, sizeof(keys_released));
     memcpy(cpu->io + (REG_EXTKEYIN - IO_BASE), &extended_keys_released,
            sizeof(extended_keys_released));
@@ -700,36 +740,40 @@ void nds_set_touch(NdsCpu *cpu, bool touching, uint16_t x, uint16_t y) {
 
 void nds_tick(NdsCpu *cpu, uint32_t cycles) {
     const uint32_t video_cycles = cpu->cpu_id == 9u ? cycles / 2u : cycles;
-    cpu->tick_count = (cpu->tick_count + video_cycles) % 560190u;
     if (video_cycles != 0u) {
-        const unsigned line_cycle = cpu->tick_count % 2130u;
-        if (line_cycle == 0u || line_cycle == 1536u) {
-            const unsigned line = cpu->tick_count / 2130u;
-            uint16_t status;
-            memcpy(&status, cpu->io + (REG_DISPSTAT - IO_BASE), sizeof(status));
-            if (line_cycle == 0u) {
-                status &= (uint16_t)~2u;
-                const bool entering_vblank = line == 192u;
-                if (entering_vblank) status |= 1u;
-                else if (line == 0u) status &= (uint16_t)~1u;
-                const unsigned comparison = (status >> 8) | ((status & 0x80u) << 1);
-                if (line == comparison) {
-                    status |= 4u;
-                    if (status & 0x20u) raise_irq(cpu, IRQ_VCOUNT);
-                } else {
-                    status &= (uint16_t)~4u;
-                }
-                if (entering_vblank && status & 8u)
-                    raise_irq(cpu, IRQ_VBLANK);
-                const uint16_t count = (uint16_t)line;
-                memcpy(cpu->io + (REG_VCOUNT - IO_BASE), &count, sizeof(count));
-            } else {
-                status |= 2u;
-                if (status & 0x10u)
-                    raise_irq(cpu, IRQ_HBLANK);
-            }
-            memcpy(cpu->io + (REG_DISPSTAT - IO_BASE), &status, sizeof(status));
+        const uint32_t old_tick = cpu->tick_count;
+        const uint32_t advanced = old_tick + video_cycles;
+        const bool wrapped = advanced >= NDS_FRAME_CYCLES;
+        const uint32_t next_tick = advanced % NDS_FRAME_CYCLES;
+        const unsigned old_line = old_tick / NDS_LINE_CYCLES;
+        const unsigned next_line = next_tick / NDS_LINE_CYCLES;
+        const unsigned old_line_cycle = old_tick % NDS_LINE_CYCLES;
+        const unsigned next_line_cycle = next_tick % NDS_LINE_CYCLES;
+        const bool line_start = wrapped || next_line != old_line;
+        const bool entering_hblank = old_line_cycle < NDS_HBLANK_CYCLES &&
+                                     old_line_cycle + video_cycles >= NDS_HBLANK_CYCLES;
+        const bool entering_vblank = !wrapped && old_line < 192u && next_line >= 192u;
+        uint16_t status;
+        memcpy(&status, cpu->io + (REG_DISPSTAT - IO_BASE), sizeof(status));
+        status = (uint16_t)((status & (uint16_t)~3u) |
+                            (next_line >= 192u ? 1u : 0u) |
+                            (next_line_cycle >= NDS_HBLANK_CYCLES ? 2u : 0u));
+        const unsigned comparison = (status >> 8) | ((status & 0x80u) << 1);
+        if (next_line == comparison) {
+            status |= 4u;
+            if (line_start && status & 0x20u)
+                raise_irq(cpu, IRQ_VCOUNT);
+        } else {
+            status &= (uint16_t)~4u;
         }
+        if (entering_hblank && status & 0x10u)
+            raise_irq(cpu, IRQ_HBLANK);
+        if (entering_vblank && status & 8u)
+            raise_irq(cpu, IRQ_VBLANK);
+        const uint16_t count = (uint16_t)next_line;
+        memcpy(cpu->io + (REG_VCOUNT - IO_BASE), &count, sizeof(count));
+        memcpy(cpu->io + (REG_DISPSTAT - IO_BASE), &status, sizeof(status));
+        cpu->tick_count = next_tick;
     }
     static const uint32_t divisors[4] = {1u, 64u, 256u, 1024u};
     bool cascade = false;
@@ -1554,8 +1598,14 @@ bool nds_exec_coprocessor(NdsCpu *cpu, uint32_t word, uint32_t pc) {
     const unsigned opcode2 = (word >> 5) & 7u;
     if (cp != 15) return false;
     if (word & (1u << 20)) {
-        cpu->r[rd] = crn == 9u && crm == 1u && opcode2 == 0u
-            ? cpu->dtcm_control : 0u;
+        if (crn == 1u && crm == 0u && opcode2 == 0u)
+            cpu->r[rd] = cpu->cp15_control;
+        else if (crn == 9u && crm == 1u && opcode2 == 0u)
+            cpu->r[rd] = cpu->dtcm_control;
+        else
+            cpu->r[rd] = 0u;
+    } else if (crn == 1u && crm == 0u && opcode2 == 0u) {
+        cpu->cp15_control = cpu->r[rd];
     } else if (crn == 9u && crm == 1u && opcode2 == 0u) {
         cpu->dtcm_control = cpu->r[rd];
         cpu->dtcm_base = cpu->dtcm_control & UINT32_C(0xfffff000);

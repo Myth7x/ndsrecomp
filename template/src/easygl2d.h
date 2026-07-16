@@ -43,6 +43,8 @@ typedef struct {
 } EasyGL2DStats;
 
 bool easygl2d_init(const char *title, int scale, bool headless);
+bool easygl2d_gl_begin(void);
+void easygl2d_gl_end(int screen_y);
 bool easygl2d_poll(void);
 uint16_t easygl2d_keyinput(void);
 uint16_t easygl2d_extkeyin(void);
