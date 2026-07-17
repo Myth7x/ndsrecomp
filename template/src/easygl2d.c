@@ -229,9 +229,10 @@ void easygl2d_gl_end(int screen_y) {
         const unsigned source_y = 191u - y;
         for (unsigned x = 0; x < 256u; ++x) {
             const uint8_t *source = pixels + (source_y * 256u + x) * 4u;
-            framebuffer[(screen_y + (int)y) * EASYGL2D_WIDTH + x] =
-                ((uint32_t)source[0] << 24) | ((uint32_t)source[1] << 16) |
-                ((uint32_t)source[2] << 8) | source[3];
+            if (source[3] != 0u)
+                framebuffer[(screen_y + (int)y) * EASYGL2D_WIDTH + x] =
+                    ((uint32_t)source[0] << 24) | ((uint32_t)source[1] << 16) |
+                    ((uint32_t)source[2] << 8) | source[3];
         }
     }
     SDL_GL_MakeCurrent(gl_window, NULL);

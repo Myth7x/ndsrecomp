@@ -621,10 +621,14 @@ def plausible_function(image: bytes, base: int, target: int, tail: int = 32) -> 
     if word is not None and (
         word & 0xFFFF0000 == 0xE92D0000
         or word >> 28 == 0xE and word & 0x0F7F0000 == 0x051F0000
-        or word == 0xE12FFF1E
+        or word & 0xFFFFFFF0 == 0xE12FFF10
     ):
         return True
-    return any(image_word(image, base, address + offset) == 0xE12FFF1E for offset in range(0, tail, 4))
+    return any(
+        (image_word(image, base, address + offset) or 0) & 0xFFFFFFF0 ==
+        0xE12FFF10
+        for offset in range(0, tail, 4)
+    )
 
 
 def find_function_roots(image: bytes, base: int, tail: int = 32) -> list[tuple[int, bool]]:
@@ -659,12 +663,38 @@ def short_linear_arm_function(
         if word is None:
             return None
         translated[pc] = word
-        if word == 0xE12FFF1E:  # BX LR
+        if word & 0xFFFFFFF0 == 0xE12FFF10:  # Unconditional BX tail call.
             return translated
+        if word & 0x0FFFFFFF == 0x012FFF1E:  # Conditional BX LR falls through.
+            continue
         if (word & 0x0E000000 == 0x0A000000 or
                 word & 0x0FFFFFF0 in (0x012FFF10, 0x012FFF30)):
             return None
     return None
+
+
+def add_adjacent_short_arm_functions(
+    arm: dict[int, int], thumb: dict[int, int], image: bytes, base: int,
+    limit: int = 0,
+) -> int:
+    """Capture unreferenced compiler leaf functions between translated siblings."""
+    before = len(arm)
+    addresses = sorted(arm)
+    for lower, upper in zip(addresses, addresses[1:]):
+        if not 8 <= upper - lower <= 64:
+            continue
+        for pc in range(lower + 4, upper, 4):
+            word = image_word(image, base, pc)
+            if (word is None or word >> 28 != 0xE or
+                    word & 0x0F7F0000 != 0x051F0000):
+                continue
+            function = short_linear_arm_function(image, base, pc)
+            if function is None or max(function) >= upper:
+                continue
+            if limit and len(arm) + len(thumb) + len(function) > limit:
+                continue
+            arm.update(function)
+    return len(arm) - before
 
 
 def add_address_taken_functions(
@@ -840,6 +870,7 @@ def reachable_instructions(
         for successor in reversed(successors):
             pending.appendleft((successor, False))
     add_address_taken_functions(arm, thumb, image, base, limit)
+    add_adjacent_short_arm_functions(arm, thumb, image, base, limit)
     return arm, thumb
 
 
@@ -1007,11 +1038,10 @@ def referenced_overlay_variants(
     # so no main-image branch can identify their overlay. Keep the fallback
     # deliberately tiny: full root expansion for every overlay is enormous.
     for overlay, overlay_image in zip(overlays, overlay_images, strict=True):
-        known_roots = set(find_function_roots(overlay_image, overlay.ram_address))
         for target, is_thumb in find_function_roots(
             overlay_image, overlay.ram_address, 256
         ):
-            if is_thumb or (target, is_thumb) in known_roots:
+            if is_thumb:
                 continue
             function = short_linear_arm_function(
                 overlay_image, overlay.ram_address, target, 64
@@ -1511,6 +1541,44 @@ def self_test() -> None:
             bytes(long_indirect_leaf), 0x02000000,
             long_indirect_target, 64,
         ) is not None
+
+        conditional_leaf = bytearray(long_indirect_leaf)
+        struct.pack_into("<I", conditional_leaf, 0x28, 0x112FFF1E)
+        assert short_linear_arm_function(
+            bytes(conditional_leaf), 0x02000000,
+            long_indirect_target, 64,
+        ) is not None
+
+        adjacent_leaf = bytearray(0x20)
+        struct.pack_into("<I", adjacent_leaf, 0, 0xE12FFF1E)
+        struct.pack_into("<4I", adjacent_leaf, 4,
+                         0, 0xE59F1004, 0xE5801000, 0xE12FFF1E)
+        struct.pack_into("<2I", adjacent_leaf, 0x14, 0, 0xE12FFF1E)
+        adjacent_arm = {
+            0x02000000: 0xE12FFF1E,
+            0x02000018: 0xE12FFF1E,
+        }
+        assert add_adjacent_short_arm_functions(
+            adjacent_arm, {}, bytes(adjacent_leaf), 0x02000000
+        ) == 3
+        assert adjacent_arm[0x02000008] == 0xE59F1004
+
+        tail_call = bytearray(0x40)
+        tail_call_target = 0x02000020
+        struct.pack_into("<I", tail_call, 0, tail_call_target)
+        struct.pack_into(
+            "<6I", tail_call, 0x20,
+            0xE1A01000, 0xE5910004, 0xE59FC004,
+            0xE590002C, 0xE12FFF1C, 0x02000038,
+        )
+        assert tail_call_target in {
+            target for target, is_thumb in find_function_roots(
+                bytes(tail_call), 0x02000000
+            ) if not is_thumb
+        }
+        assert len(short_linear_arm_function(
+            bytes(tail_call), 0x02000000, tail_call_target
+        ) or {}) == 5
 
         chain_rom = root / "overlay-chain.nds"
         chain_data = bytearray(0x300)

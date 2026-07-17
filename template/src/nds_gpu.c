@@ -33,6 +33,13 @@ typedef struct {
     float color[3];
 } GpuLight;
 
+typedef struct {
+    uint32_t texture;
+    uint32_t palette;
+    GLuint name;
+    bool ready;
+} GpuTextureCacheEntry;
+
 struct NdsGpuTag {
     float matrix[4][16];
     float stack[4][GPU_STACK_DEPTH][16];
@@ -1114,6 +1121,7 @@ static void execute_command(NdsGpu *gpu) {
             gpu->pending_triangle_count = count;
             gpu->swap_pending = true;
             gpu->triangle_count = 0u;
+            gpu->vertex_count = 0u;
         }
         break;
     case 0x70:
@@ -1186,13 +1194,7 @@ void nds_gpu_destroy(NdsGpu *gpu) {
 }
 
 void nds_gpu_begin_frame(NdsGpu *gpu) {
-    if (gpu != NULL) {
-        gpu->triangle_count = 0u;
-        gpu->vertex_count = 0u;
-        gpu->in_primitive = false;
-        gpu->strip_count = 0u;
-        gpu->strip_parity = 0u;
-    }
+    (void)gpu;
 }
 
 void nds_gpu_vblank(NdsGpu *gpu) {
@@ -1328,8 +1330,10 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
     GLint stencil_bits = 0;
     glGetIntegerv(GL_STENCIL_BITS, &stencil_bits);
     has_shadow_mask = has_shadow_mask && stencil_bits != 0;
-    GLuint texture_name = 0;
-    glGenTextures(1, &texture_name);
+    GpuTextureCacheEntry *texture_cache = calloc(
+        gpu->visible_triangle_count == 0u ? 1u : gpu->visible_triangle_count,
+        sizeof(*texture_cache));
+    size_t texture_cache_count = 0u;
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
@@ -1372,9 +1376,6 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
     } else {
         glDisable(GL_ALPHA_TEST);
     }
-    uint32_t uploaded_texture = UINT32_MAX;
-    uint32_t uploaded_palette = UINT32_MAX;
-    bool texture_ready = false;
     for (unsigned draw_pass = 0; draw_pass < 4u; ++draw_pass)
     for (size_t index = 0; index < gpu->visible_triangle_count; ++index) {
         const GpuTriangle *triangle = &gpu->visible_triangles[index];
@@ -1402,11 +1403,23 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
         const bool texture_alpha = textured &&
             (format == 1u || format == 5u || format == 6u || format == 7u ||
              (triangle->texture & (1u << 29)) != 0u);
-        if (textured && (triangle->texture != uploaded_texture ||
-                         triangle->palette != uploaded_palette)) {
-            texture_ready = upload_texture(cpu, triangle, texture_name);
-            uploaded_texture = triangle->texture;
-            uploaded_palette = triangle->palette;
+        bool texture_ready = false;
+        if (textured && texture_cache != NULL) {
+            size_t cache_index = 0u;
+            while (cache_index < texture_cache_count &&
+                   (texture_cache[cache_index].texture != triangle->texture ||
+                    texture_cache[cache_index].palette != triangle->palette))
+                ++cache_index;
+            if (cache_index == texture_cache_count) {
+                GpuTextureCacheEntry *entry = &texture_cache[texture_cache_count++];
+                entry->texture = triangle->texture;
+                entry->palette = triangle->palette;
+                glGenTextures(1, &entry->name);
+                entry->ready = upload_texture(cpu, triangle, entry->name);
+            }
+            texture_ready = texture_cache[cache_index].ready;
+            if (texture_ready)
+                glBindTexture(GL_TEXTURE_2D, texture_cache[cache_index].name);
         }
         textured = textured && texture_ready;
         if (textured)
@@ -1526,7 +1539,9 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
             glEnd();
         }
     }
-    glDeleteTextures(1, &texture_name);
+    for (size_t index = 0u; index < texture_cache_count; ++index)
+        glDeleteTextures(1, &texture_cache[index].name);
+    free(texture_cache);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_FOG);
