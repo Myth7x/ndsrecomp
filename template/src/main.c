@@ -334,6 +334,12 @@ int main(int argc, char **argv) {
            result_name(result), stats.frame, cpu.r[15], arm7.r[15],
            nds_read32(&cpu, UINT32_C(0x04000000)),
            nds_read32(&cpu, UINT32_C(0x04001000)));
+    fputs("final texture formats (triangles/unique):", stdout);
+    for (unsigned format = 0u; format < 8u; ++format)
+        printf(" %u=%zu/%zu", format,
+               nds_gpu_texture_format_count(cpu.gpu, format),
+               nds_gpu_unique_texture_count(cpu.gpu, format));
+    putchar('\n');
     nds_cpu_destroy(&arm7);
     nds_cpu_destroy(&cpu);
     easygl2d_shutdown();

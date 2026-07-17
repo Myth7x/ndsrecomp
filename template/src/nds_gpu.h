@@ -14,6 +14,8 @@ uint64_t nds_gpu_command_count(const NdsGpu *gpu);
 uint64_t nds_gpu_unsupported_count(const NdsGpu *gpu);
 uint32_t nds_gpu_command_histogram(const NdsGpu *gpu, unsigned command);
 unsigned nds_gpu_max_texture_pixels(const NdsGpu *gpu);
+size_t nds_gpu_texture_format_count(const NdsGpu *gpu, unsigned format);
+size_t nds_gpu_unique_texture_count(const NdsGpu *gpu, unsigned format);
 uint32_t nds_gpu_read_status(const NdsGpu *gpu);
 uint32_t nds_gpu_read_ram_count(const NdsGpu *gpu);
 uint32_t nds_gpu_read_position_result(const NdsGpu *gpu, unsigned index);

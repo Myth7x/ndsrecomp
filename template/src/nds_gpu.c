@@ -151,8 +151,6 @@ static float fixed10_relative(uint32_t value) {
     int32_t result = (int32_t)(value & 0x3ffu);
     if (result & 0x200)
         result |= ~0x3ff;
-    /* VTX_DIFF adds a sign-extended integer to the 16.12 current vertex;
-     * unlike VTX_10, it is not a 10.6 value. */
     return (float)result / 4096.0f;
 }
 
@@ -594,6 +592,10 @@ static bool append_triangle(NdsGpu *gpu, const GpuVertex *a,
     const bool visible = polygon_is_visible(gpu, a, b, c);
     if (!visible)
         return true;
+    if ((gpu->polygon & (1u << 12)) == 0u &&
+        (a->clip[2] > a->clip[3] || b->clip[2] > b->clip[3] ||
+         c->clip[2] > c->clip[3]))
+        return true;
     GpuVertex input[16];
     GpuVertex output[16];
     unsigned count = 3u;
@@ -705,7 +707,7 @@ static uint32_t compressed_texel(const NdsCpu *cpu, uint32_t texture,
     const uint16_t palette_info = nds_read16(cpu,
         UINT32_C(0x06800000) + palette_index_address);
     const unsigned index = address >= 0x20000u && address < 0x40000u ? 0u :
-        (nds_read32(cpu, UINT32_C(0x06800000) + (address & ~3u)) >>
+        (nds_read8(cpu, UINT32_C(0x06800000) + address) >>
          ((x & 3u) * 2u)) & 3u;
     const uint32_t palette_address = UINT32_C(0x06880000) +
         (palette & 0x1fffu) * 16u + (palette_info & 0x3fffu) * 4u;
@@ -732,8 +734,6 @@ static uint32_t compressed_texel(const NdsCpu *cpu, uint32_t texture,
             color = mix555(color0, color1, 3u, 5u, 8u);
         }
     }
-    if (index == 0u && (texture & (1u << 29)) != 0u)
-        transparent = true;
     return transparent ? rgba15_direct(0u) : rgba15(color);
 }
 
@@ -1583,6 +1583,33 @@ unsigned nds_gpu_max_texture_pixels(const NdsGpu *gpu) {
             maximum = width * height;
     }
     return maximum;
+}
+
+size_t nds_gpu_texture_format_count(const NdsGpu *gpu, unsigned format) {
+    size_t count = 0u;
+    if (gpu == NULL || format >= 8u)
+        return 0u;
+    for (size_t index = 0; index < gpu->visible_triangle_count; ++index)
+        count += ((gpu->visible_triangles[index].texture >> 26) & 7u) == format;
+    return count;
+}
+
+size_t nds_gpu_unique_texture_count(const NdsGpu *gpu, unsigned format) {
+    size_t count = 0u;
+    if (gpu == NULL || format >= 8u)
+        return 0u;
+    for (size_t index = 0; index < gpu->visible_triangle_count; ++index) {
+        const GpuTriangle *triangle = &gpu->visible_triangles[index];
+        if (((triangle->texture >> 26) & 7u) != format)
+            continue;
+        size_t previous = 0u;
+        while (previous < index &&
+               (gpu->visible_triangles[previous].texture != triangle->texture ||
+                gpu->visible_triangles[previous].palette != triangle->palette))
+            ++previous;
+        count += previous == index;
+    }
+    return count;
 }
 
 uint32_t nds_gpu_read_status(const NdsGpu *gpu) {

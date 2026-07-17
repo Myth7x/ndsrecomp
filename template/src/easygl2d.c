@@ -204,7 +204,7 @@ bool easygl2d_init(const char *title, int scale, bool headless) {
     SDL_SetRenderLogicalPresentation(renderer, EASYGL2D_WINDOW_WIDTH,
                                      EASYGL2D_HEIGHT,
                                      SDL_LOGICAL_PRESENTATION_LETTERBOX);
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888,
                                 SDL_TEXTUREACCESS_STREAMING,
                                 EASYGL2D_WIDTH, EASYGL2D_HEIGHT);
     gl_window = SDL_CreateWindow(title, EASYGL2D_WIDTH, 192,
