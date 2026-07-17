@@ -41,27 +41,27 @@ static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
                       NdsRunResult *result, NdsRunResult *arm7_result) {
     for (uint32_t step = 0; step < count;) {
         uint32_t quantum = count - step;
-        if (quantum > 1u)
-            quantum = 1u;
+        if (quantum > 64u)
+            quantum = 64u;
+        if (cpu->wait_cycles != 0u && cpu->wait_cycles < quantum)
+            quantum = cpu->wait_cycles;
+        if (arm7->wait_cycles != 0u && arm7->wait_cycles < quantum)
+            quantum = arm7->wait_cycles;
         step += quantum;
         nds_tick(cpu, quantum * 2u);
         nds_tick(arm7, quantum);
+        nds_poll_interrupts(cpu);
         if (cpu->wait_cycles != 0u) {
             cpu->wait_cycles = cpu->wait_cycles > quantum ? cpu->wait_cycles - quantum : 0u;
-            nds_poll_interrupts(cpu);
-        } else if (cpu->halted) {
-            nds_poll_interrupts(cpu);
-        } else {
+        } else if (!cpu->halted) {
             *result = nds_run_arm9(cpu, quantum);
             if (*result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
         }
+        nds_poll_interrupts(arm7);
         if (arm7->wait_cycles != 0u) {
             arm7->wait_cycles = arm7->wait_cycles > quantum ? arm7->wait_cycles - quantum : 0u;
-            nds_poll_interrupts(arm7);
-        } else if (arm7->halted) {
-            nds_poll_interrupts(arm7);
-        } else {
+        } else if (!arm7->halted) {
             *arm7_result = nds_run_arm7(arm7, quantum);
             if (*arm7_result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
@@ -327,6 +327,13 @@ int main(int argc, char **argv) {
         frame_deadline += NDS_FRAME_NS;
         previous_frame_start = frame_start;
     }
+    if (dump_path != NULL && !easygl2d_dump_framebuffer(dump_path))
+        fprintf(stderr, "failed to dump framebuffer to %s\n", dump_path);
+    printf("final: run=%s frames=%" PRIu64 " pc=%08" PRIx32 "/%08" PRIx32
+           " display=%08" PRIx32 "/%08" PRIx32 "\n",
+           result_name(result), stats.frame, cpu.r[15], arm7.r[15],
+           nds_read32(&cpu, UINT32_C(0x04000000)),
+           nds_read32(&cpu, UINT32_C(0x04001000)));
     nds_cpu_destroy(&arm7);
     nds_cpu_destroy(&cpu);
     easygl2d_shutdown();

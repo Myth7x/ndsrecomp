@@ -8,9 +8,80 @@
 
 #define IO_BASE UINT32_C(0x04000000)
 #define PALETTE_BASE UINT32_C(0x05000000)
+#define VIDEO_VRAM_BASE UINT32_C(0x06000000)
+#define VIDEO_VRAM_END UINT32_C(0x068a0000)
+#define VIDEO_VRAM_PAGE_SHIFT 12u
+#define VIDEO_VRAM_PAGE_SIZE (UINT32_C(1) << VIDEO_VRAM_PAGE_SHIFT)
+#define VIDEO_VRAM_PAGE_COUNT \
+    ((VIDEO_VRAM_END - VIDEO_VRAM_BASE) / VIDEO_VRAM_PAGE_SIZE)
 
 static uint8_t video_layer_map[2][256u * 192u];
 static uint8_t video_obj_window[2][256u * 192u];
+static const uint8_t *video_vram_pages[VIDEO_VRAM_PAGE_COUNT][9];
+static uint8_t video_vram_page_counts[VIDEO_VRAM_PAGE_COUNT];
+static uint8_t video_vram_controls[9];
+static bool video_vram_cache_valid;
+
+static void video_cache_vram(const NdsCpu *cpu) {
+    static const unsigned control_offsets[9] = {
+        0x240u, 0x241u, 0x242u, 0x243u, 0x244u,
+        0x245u, 0x246u, 0x248u, 0x249u
+    };
+    uint8_t controls[9];
+    for (unsigned bank = 0; bank < 9u; ++bank)
+        controls[bank] = cpu->io[control_offsets[bank]];
+    if (video_vram_cache_valid &&
+        memcmp(video_vram_controls, controls, sizeof(controls)) == 0)
+        return;
+    memcpy(video_vram_controls, controls, sizeof(controls));
+    video_vram_cache_valid = true;
+    for (unsigned page = 0; page < VIDEO_VRAM_PAGE_COUNT; ++page) {
+        const uint32_t address = VIDEO_VRAM_BASE +
+                                 page * VIDEO_VRAM_PAGE_SIZE;
+        unsigned count = 0u;
+        for (unsigned bank = 0; bank < 9u; ++bank) {
+            const uint8_t *pointer =
+                nds_vram_bank_pointer(cpu, bank, address);
+            if (pointer != NULL)
+                video_vram_pages[page][count++] = pointer;
+        }
+        video_vram_page_counts[page] = (uint8_t)count;
+    }
+}
+
+static uint8_t video_read8(const NdsCpu *cpu, uint32_t address) {
+    if (address >= VIDEO_VRAM_BASE && address < VIDEO_VRAM_END) {
+        const uint32_t relative = address - VIDEO_VRAM_BASE;
+        const unsigned page = relative >> VIDEO_VRAM_PAGE_SHIFT;
+        const unsigned offset = relative & (VIDEO_VRAM_PAGE_SIZE - 1u);
+        const unsigned count = video_vram_page_counts[page];
+        if (count == 0u)
+            return 0u;
+        if (count == 1u)
+            return video_vram_pages[page][0][offset];
+        uint8_t value = 0u;
+        for (unsigned index = 0; index < count; ++index)
+            value |= video_vram_pages[page][index][offset];
+        return value;
+    }
+    return nds_read8(cpu, address);
+}
+
+static uint16_t video_read16(const NdsCpu *cpu, uint32_t address) {
+    if (address >= VIDEO_VRAM_BASE && address + 1u < VIDEO_VRAM_END) {
+        const uint32_t relative = address - VIDEO_VRAM_BASE;
+        const unsigned page = relative >> VIDEO_VRAM_PAGE_SHIFT;
+        const unsigned offset = relative & (VIDEO_VRAM_PAGE_SIZE - 1u);
+        if (offset + 1u < VIDEO_VRAM_PAGE_SIZE &&
+            video_vram_page_counts[page] == 1u) {
+            const uint8_t *pointer = video_vram_pages[page][0] + offset;
+            return (uint16_t)(pointer[0] | ((uint16_t)pointer[1] << 8));
+        }
+        return (uint16_t)(video_read8(cpu, address) |
+                          ((uint16_t)video_read8(cpu, address + 1u) << 8));
+    }
+    return nds_read16(cpu, address);
+}
 
 static uint16_t io16(const NdsCpu *cpu, unsigned offset) {
     return (uint16_t)(cpu->io[offset] | ((uint16_t)cpu->io[offset + 1u] << 8));
@@ -208,7 +279,7 @@ static void render_text_background(const NdsCpu *cpu, unsigned engine,
             if (height == 512u)
                 screen_block += (tile_y >> 5) * (width >> 8);
             const unsigned map_index = (tile_y & 31u) * 32u + (tile_x & 31u);
-            const uint16_t entry = nds_read16(cpu, vram_base + screen_base +
+            const uint16_t entry = video_read16(cpu, vram_base + screen_base +
                                                    screen_block * 0x800u + map_index * 2u);
             unsigned pixel_x = source_x & 7u;
             unsigned pixel_y = source_y & 7u;
@@ -218,7 +289,7 @@ static void render_text_background(const NdsCpu *cpu, unsigned engine,
             unsigned palette_index;
             uint32_t color_address;
             if (color_256) {
-                palette_index = nds_read8(cpu, vram_base + character_base +
+                palette_index = video_read8(cpu, vram_base + character_base +
                                                tile * 64u + pixel_y * 8u + pixel_x);
                 color_address = extended_palette ?
                     bg_extended_palette_address(engine, background, control,
@@ -226,7 +297,7 @@ static void render_text_background(const NdsCpu *cpu, unsigned engine,
                                                 palette_index) :
                     palette_base + palette_index * 2u;
             } else {
-                const uint8_t packed = nds_read8(cpu, vram_base + character_base +
+                const uint8_t packed = video_read8(cpu, vram_base + character_base +
                                                       tile * 32u + pixel_y * 4u + pixel_x / 2u);
                 palette_index = pixel_x & 1u ? packed >> 4 : packed & 15u;
                 color_address = palette_base + ((entry >> 12) & 15u) * 32u +
@@ -234,7 +305,7 @@ static void render_text_background(const NdsCpu *cpu, unsigned engine,
             }
             if (palette_index != 0u)
                 video_put_pixel(cpu, (int)x, screen_y + (int)y,
-                                nds_read16(cpu, color_address));
+                                video_read16(cpu, color_address));
         }
     }
 }
@@ -311,17 +382,17 @@ static void render_affine_background(const NdsCpu *cpu, unsigned engine,
                     bitmap_y * width * (direct_color ? 2u : 1u) +
                     bitmap_x * (direct_color ? 2u : 1u);
                 if (!direct_color) {
-                    const unsigned index = nds_read8(cpu, address);
+                    const unsigned index = video_read8(cpu, address);
                     if (index != 0u) {
                         const uint32_t color_address = extended_palette && map_16 ?
                             bg_extended_palette_address(engine, background,
                                                         control, 0u, index) :
                             palette_base + index * 2u;
                         video_put_pixel(cpu, (int)x, screen_y + (int)y,
-                                        nds_read16(cpu, color_address));
+                                        video_read16(cpu, color_address));
                     }
                 } else {
-                    const uint16_t color = nds_read16(cpu, address);
+                    const uint16_t color = video_read16(cpu, address);
                     if (color & 0x8000u)
                         video_put_pixel(cpu, (int)x, screen_y + (int)y, color);
                 }
@@ -339,20 +410,20 @@ static void render_affine_background(const NdsCpu *cpu, unsigned engine,
             const unsigned map_width = width >> 3;
             uint16_t entry = 0u;
             if (map_16) {
-                entry = nds_read16(cpu, vram_base + screen_base +
+                entry = video_read16(cpu, vram_base + screen_base +
                     (tile_y * map_width + tile_x) * 2u);
                 if ((entry & 0x0400u) != 0u) pixel_x = 7u - pixel_x;
                 if ((entry & 0x0800u) != 0u) pixel_y = 7u - pixel_y;
             } else {
-                entry = nds_read8(cpu, vram_base + screen_base +
+                entry = video_read8(cpu, vram_base + screen_base +
                     tile_y * map_width + tile_x);
             }
             const unsigned tile = entry & 0x03ffu;
-            const unsigned pixel = nds_read8(cpu, vram_base + character_base +
+            const unsigned pixel = video_read8(cpu, vram_base + character_base +
                 tile * 64u + pixel_y * 8u + pixel_x);
             if (pixel != 0u)
                            video_put_pixel(cpu, (int)x, screen_y + (int)y,
-                           nds_read16(cpu, map_16 && extended_palette ?
+                           video_read16(cpu, map_16 && extended_palette ?
                                bg_extended_palette_address(engine, background,
                                                            control,
                                                            (entry >> 12) & 15u,
@@ -375,15 +446,17 @@ static void obj_dimensions(unsigned shape, unsigned size,
 }
 
 static uint32_t obj_tile_address(uint32_t display, unsigned tile,
-                                 bool color_256) {
+                                 bool color_256, unsigned tile_x,
+                                 unsigned tile_y, unsigned width_tiles) {
+    const unsigned tile_bytes = color_256 ? 64u : 32u;
     if ((display & (1u << 4)) != 0u) {
         const unsigned boundary = 0x20u << ((display >> 20) & 3u);
-        return tile * boundary;
+        return tile * boundary +
+               (tile_y * width_tiles + tile_x) * tile_bytes;
     }
-    const unsigned row_mask = color_256 ? 15u : 31u;
-    const unsigned tile_bytes = color_256 ? 64u : 32u;
-    return (tile & row_mask) * tile_bytes +
-           (tile & ~row_mask) * 0x400u;
+    const unsigned name = (color_256 ? tile & ~1u : tile) + tile_y * 32u +
+                          tile_x * (color_256 ? 2u : 1u);
+    return name * 32u;
 }
 
 static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
@@ -404,9 +477,9 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
     for (int object = 127; object >= 0; --object) {
         const uint32_t oam = UINT32_C(0x07000000) + engine * 0x400u +
                              (unsigned)object * 8u;
-        const uint16_t attr0 = nds_read16(cpu, oam + 0u);
-        const uint16_t attr1 = nds_read16(cpu, oam + 2u);
-        const uint16_t attr2 = nds_read16(cpu, oam + 4u);
+        const uint16_t attr0 = video_read16(cpu, oam + 0u);
+        const uint16_t attr1 = video_read16(cpu, oam + 2u);
+        const uint16_t attr2 = video_read16(cpu, oam + 4u);
         const bool affine = (attr0 & (1u << 8)) != 0u;
         const unsigned sprite_mode = (attr0 >> 10) & 3u;
         if (!affine && (attr0 & (1u << 9)) != 0u)
@@ -437,18 +510,17 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
             origin_y -= (int)draw_height / 2;
         }
         const unsigned rotation = (attr1 >> 9) & 31u;
-        const int16_t pa = affine ? (int16_t)nds_read16(cpu,
+        const int16_t pa = affine ? (int16_t)video_read16(cpu,
             UINT32_C(0x07000000) + engine * 0x400u + 6u + rotation * 32u) : 0x100;
-        const int16_t pb = affine ? (int16_t)nds_read16(cpu,
+        const int16_t pb = affine ? (int16_t)video_read16(cpu,
             UINT32_C(0x07000000) + engine * 0x400u + 14u + rotation * 32u) : 0;
-        const int16_t pc = affine ? (int16_t)nds_read16(cpu,
+        const int16_t pc = affine ? (int16_t)video_read16(cpu,
             UINT32_C(0x07000000) + engine * 0x400u + 22u + rotation * 32u) : 0;
-        const int16_t pd = affine ? (int16_t)nds_read16(cpu,
+        const int16_t pd = affine ? (int16_t)video_read16(cpu,
             UINT32_C(0x07000000) + engine * 0x400u + 30u + rotation * 32u) : 0x100;
         const bool color_256 = (attr0 & (1u << 13)) != 0u;
         const unsigned tile = attr2 & 0x3ffu;
         const unsigned palette = (attr2 >> 12) & 15u;
-        const unsigned tile_bytes = color_256 ? 64u : 32u;
         const unsigned source_width_tiles = width / 8u;
         for (unsigned y = 0; y < draw_height; ++y) {
             const int output_y = origin_y + (int)y;
@@ -484,7 +556,7 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
                         const uint32_t base = (tile <<
                             (7u + ((display >> 22) & 1u))) +
                             source_y * width * 2u;
-                        const uint16_t color = nds_read16(cpu, vram_base +
+                        const uint16_t color = video_read16(cpu, vram_base +
                             base + source_x * 2u);
                         if ((color & 0x8000u) != 0u)
                             video_put_pixel_ex(cpu, output_x,
@@ -496,7 +568,7 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
                             ((tile & 0x3e0u) << 7) + source_y * 512u :
                             ((tile & 0x0fu) << 4) +
                             ((tile & 0x3f0u) << 7) + source_y * 256u;
-                        const uint16_t color = nds_read16(cpu, vram_base +
+                        const uint16_t color = video_read16(cpu, vram_base +
                             base + source_x * 2u);
                         if ((color & 0x8000u) != 0u)
                             video_put_pixel_ex(cpu, output_x,
@@ -508,27 +580,18 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
                 }
                 const unsigned tile_x = source_x >> 3;
                 const unsigned tile_y = source_y >> 3;
-                unsigned tile_number;
-                if ((display & (1u << 4)) != 0u) {
-                    tile_number = tile + tile_y * source_width_tiles + tile_x;
-                    if (color_256)
-                        tile_number = tile + tile_y * source_width_tiles * 2u + tile_x * 2u;
-                } else {
-                    tile_number = tile + (tile_y * 32u) + tile_x;
-                    if (color_256)
-                        tile_number = tile + (tile_y * 16u) + tile_x;
-                }
                 const unsigned pixel_x = source_x & 7u;
                 const unsigned pixel_y = source_y & 7u;
                 const uint32_t address = vram_base +
-                    obj_tile_address(display, tile_number, color_256) +
+                    obj_tile_address(display, tile, color_256, tile_x, tile_y,
+                                     source_width_tiles) +
                     pixel_y * (color_256 ? 8u : 4u) +
                     (color_256 ? pixel_x : pixel_x / 2u);
                 unsigned index;
                 if (color_256) {
-                    index = nds_read8(cpu, address);
+                    index = video_read8(cpu, address);
                 } else {
-                    const uint8_t packed = nds_read8(cpu, address);
+                    const uint8_t packed = video_read8(cpu, address);
                     index = (pixel_x & 1u) ? packed >> 4 : packed & 15u;
                     index += palette * 16u;
                 }
@@ -548,13 +611,12 @@ static bool render_obj(const NdsCpu *cpu, unsigned engine, unsigned priority,
                                     UINT32_C(0x06898000)) +
                     palette * 0x200u + index * 2u :
                     palette_base + index * 2u;
-                const uint16_t color = nds_read16(cpu, color_address);
+                const uint16_t color = video_read16(cpu, color_address);
                 video_put_pixel(cpu, output_x, screen_y + output_y, color);
                 rendered = true;
             }
         }
     }
-    (void)tile_bytes;
     return rendered;
 }
 
@@ -589,7 +651,7 @@ static void render_engine(const NdsCpu *cpu, unsigned engine, int screen_y,
     const bool engine_enabled = (power & (engine == 0u ? (1u << 1) :
                                           (1u << 9))) != 0u;
     if (clear) {
-        const uint16_t backdrop = nds_read16(cpu, PALETTE_BASE + engine * 0x400u);
+        const uint16_t backdrop = video_read16(cpu, PALETTE_BASE + engine * 0x400u);
         const int base_color = display_mode == 0u ? 0x7fffu : backdrop;
         glBoxFilled(0, screen_y, 255, screen_y + 191, base_color);
         video_clear_layer_map(screen_y);
@@ -615,7 +677,7 @@ static void render_engine(const NdsCpu *cpu, unsigned engine, int screen_y,
         for (unsigned y = 0; y < 192u; ++y)
             for (unsigned x = 0; x < 256u; ++x)
                 glPutPixel((int)x, screen_y + (int)y,
-                           nds_read16(cpu, base + (y * 256u + x) * 2u));
+                           video_read16(cpu, base + (y * 256u + x) * 2u));
         easygl2d_apply_brightness(screen_y,
                                   io16(cpu, registers + 0x6cu));
         return;
@@ -669,6 +731,7 @@ static void render_engine(const NdsCpu *cpu, unsigned engine, int screen_y,
 }
 
 void nds_video_render(const NdsCpu *cpu) {
+    video_cache_vram(cpu);
     /* POWCNT1 bit 15 selects the physical destination of display A:
        set means upper LCD, clear means lower LCD. */
     const bool main_upper = (io16(cpu, 0x304u) & 0x8000u) != 0u;

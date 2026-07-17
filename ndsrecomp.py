@@ -620,7 +620,7 @@ def plausible_function(image: bytes, base: int, target: int, tail: int = 32) -> 
     word = image_word(image, base, address)
     if word is not None and (
         word & 0xFFFF0000 == 0xE92D0000
-        or word & 0xFFFFF000 == 0xE59FC000
+        or word >> 28 == 0xE and word & 0x0F7F0000 == 0x051F0000
         or word == 0xE12FFF1E
     ):
         return True
@@ -672,7 +672,14 @@ def add_address_taken_functions(
     limit: int = 0,
 ) -> int:
     before = len(arm) + len(thumb)
-    roots = deque(find_function_roots(image, base))
+    roots = deque(sorted(
+        set(find_function_roots(image, base)) |
+        {
+            (base + offset, False)
+            for offset in range(0, len(image) - 3, 4)
+            if read_u32(image, offset) & 0xFFFF0000 == 0xE92D0000
+        }
+    ))
     while roots and (limit == 0 or len(arm) + len(thumb) < limit):
         root = roots.popleft()
         pending = deque([root])
@@ -842,6 +849,18 @@ def external_targets(
     end = base + len(image)
     targets: set[tuple[int, bool]] = set()
     for pc, word in arm.items():
+        if word & 0x0F7F0000 == 0x051F0000:
+            register = (word >> 12) & 15
+            value = literal_value(image, base, pc, word, register)
+            for distance in range(1, 9):
+                exchange = image_word(image, base, pc + distance * 4)
+                if exchange is None:
+                    break
+                if (exchange & 0x0FFFFFF0 in (0x012FFF10, 0x012FFF30)
+                        and exchange & 15 == register):
+                    if value is not None and not base <= (value & ~1) < end:
+                        targets.add((value & ~1, bool(value & 1)))
+                    break
         if word & 0xFE000000 == 0xFA000000:
             offset = sign_extend(((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26)
             target = ((pc + 8 + offset) & 0xFFFFFFFF, True)
@@ -852,9 +871,54 @@ def external_targets(
             if not base <= target < end:
                 targets.add((target, False))
     for pc, half in thumb.items():
+        if half & 0xF800 == 0x4800:
+            register = (half >> 8) & 7
+            literal = ((pc + 4) & ~3) + (half & 0xFF) * 4
+            value = image_word(image, base, literal)
+            for distance in range(1, 4):
+                exchange = image_half(image, base, pc + distance * 2)
+                if exchange is None:
+                    break
+                if (exchange & 0xFF87 in (0x4700, 0x4780)
+                        and (exchange >> 3) & 15 == register):
+                    if value is not None and not base <= (value & ~1) < end:
+                        targets.add((value & ~1, bool(value & 1)))
+                    break
         for target in thumb_successors(image, base, pc, half):
             if not base <= target[0] < end:
                 targets.add(target)
+    return targets
+
+
+def copied_external_targets(
+    image: bytes, base: int, copies: list[dict[str, int]]
+) -> set[tuple[int, bool]]:
+    targets: set[tuple[int, bool]] = set()
+    for copy in copies:
+        for offset in range(0, copy["size"], 4):
+            pc = copy["destination"] + offset
+            word = image_word(image, base, copy["source"] + offset)
+            if word is None:
+                continue
+            if word & 0xFE000000 == 0xFA000000:
+                displacement = sign_extend(
+                    ((word & 0xFFFFFF) << 2) | ((word >> 23) & 2), 26
+                )
+                targets.add(((pc + 8 + displacement) & 0xFFFFFFFF, True))
+            elif word & 0x0E000000 == 0x0A000000:
+                displacement = sign_extend(word & 0xFFFFFF, 24) * 4
+                targets.add(((pc + 8 + displacement) & 0xFFFFFFFF, False))
+        for offset in range(2, copy["size"], 2):
+            pc = copy["destination"] + offset
+            prefix = image_half(image, base, copy["source"] + offset - 2)
+            half = image_half(image, base, copy["source"] + offset)
+            if (prefix is None or half is None or prefix & 0xF800 != 0xF000
+                    or half & 0xF800 not in (0xF800, 0xE800)):
+                continue
+            high = sign_extend(prefix & 0x7FF, 11) << 12
+            target = pc + 2 + high + ((half & 0x7FF) << 1)
+            is_thumb = half & 0xF800 == 0xF800
+            targets.add((target & (~1 if is_thumb else ~3), is_thumb))
     return targets
 
 
@@ -865,50 +929,92 @@ def referenced_overlay_variants(
     base: int,
     entry: int,
     instruction_limit: int,
+    copies: list[dict[str, int]],
 ) -> list[tuple[dict[int, int], dict[int, int]]]:
     arm, thumb = reachable_instructions(image, base, entry, instruction_limit)
-    pending = external_targets(image, base, arm, thumb)
-    variants: list[tuple[dict[int, int], dict[int, int]]] = []
-    matched = [
-        overlay for overlay in overlays
-        if any(
-            overlay.ram_address <= target < overlay.ram_address + overlay.ram_size
-            for target, _ in pending
-        )
-    ]
-    for overlay in matched:
-        overlay_image = read_overlay_image(rom_path, overlay)
-        roots = {
-            (target, is_thumb) for target, is_thumb in pending
-            if overlay.ram_address <= target < overlay.ram_address + len(overlay_image)
-        }
-        for address in range(overlay.static_init_start, overlay.static_init_end, 4):
-            target = image_word(overlay_image, overlay.ram_address, address)
-            if target is not None and overlay.ram_address <= (target & ~1) < overlay.ram_address + len(overlay_image):
-                roots.add((target & ~1, bool(target & 1)))
-        overlay_arm: dict[int, int] = {}
-        overlay_thumb: dict[int, int] = {}
-        for target, is_thumb in roots:
+    overlay_images = [read_overlay_image(rom_path, overlay) for overlay in overlays]
+    discovered = [({}, {}) for _ in overlays]
+    pending = deque(sorted(
+        external_targets(image, base, arm, thumb) |
+        copied_external_targets(image, base, copies)
+    ))
+    main_arm: dict[int, int] = {}
+    main_thumb: dict[int, int] = {}
+    main_roots: set[tuple[int, bool]] = set()
+    seen: set[tuple[int, bool]] = set()
+    while pending or main_roots:
+        if not pending:
+            roots = [
+                root for root in sorted(main_roots)
+                if root[0] not in (main_thumb if root[1] else main_arm)
+                and root[0] not in (thumb if root[1] else arm)
+            ]
+            main_roots.clear()
+            if not roots:
+                continue
+            first, *rest = roots
             found_arm, found_thumb = reachable_instructions(
-                overlay_image, overlay.ram_address, target, 0, is_thumb
+                image, base, first[0], 0, first[1], tuple(rest)
+            )
+            main_arm.update(found_arm)
+            main_thumb.update(found_thumb)
+            for exit_target in sorted(external_targets(
+                image, base, found_arm, found_thumb
+            )):
+                if exit_target not in seen:
+                    pending.append(exit_target)
+            continue
+        root = pending.popleft()
+        if root in seen:
+            continue
+        seen.add(root)
+        target, is_thumb = root
+        if base <= target < base + len(image):
+            if (target not in (main_thumb if is_thumb else main_arm)
+                    and target not in (thumb if is_thumb else arm)):
+                main_roots.add(root)
+            continue
+        for index, (overlay, overlay_image) in enumerate(zip(overlays, overlay_images, strict=True)):
+            if not overlay.ram_address <= target < overlay.ram_address + len(overlay_image):
+                continue
+            overlay_arm, overlay_thumb = discovered[index]
+            if target in (overlay_thumb if is_thumb else overlay_arm):
+                continue
+            roots = {root}
+            if not overlay_arm and not overlay_thumb:
+                for address in range(overlay.static_init_start, overlay.static_init_end, 4):
+                    initializer = image_word(overlay_image, overlay.ram_address, address)
+                    if (initializer is not None and
+                            overlay.ram_address <= (initializer & ~1) <
+                            overlay.ram_address + len(overlay_image)):
+                        roots.add((initializer & ~1, bool(initializer & 1)))
+            first, *rest = sorted(roots)
+            found_arm, found_thumb = reachable_instructions(
+                overlay_image, overlay.ram_address, first[0], 0, first[1], tuple(rest)
             )
             overlay_arm.update(found_arm)
             overlay_thumb.update(found_thumb)
-        variants.append((overlay_arm, overlay_thumb))
+            for exit_target in sorted(external_targets(
+                overlay_image, overlay.ram_address, found_arm, found_thumb
+            )):
+                if exit_target not in seen:
+                    pending.append(exit_target)
+
+    variants = [(main_arm, main_thumb)] if main_arm or main_thumb else []
+    variants.extend(variant for variant in discovered if variant[0] or variant[1])
 
     # Some games dispatch through function pointers in overlays loaded later,
     # so no main-image branch can identify their overlay. Keep the fallback
     # deliberately tiny: full root expansion for every overlay is enormous.
-    for overlay in overlays:
-        overlay_image = read_overlay_image(rom_path, overlay)
+    for overlay, overlay_image in zip(overlays, overlay_images, strict=True):
         known_roots = set(find_function_roots(overlay_image, overlay.ram_address))
         for target, is_thumb in find_function_roots(
-            overlay_image, overlay.ram_address, 64
+            overlay_image, overlay.ram_address, 256
         ):
             if is_thumb or (target, is_thumb) in known_roots:
                 continue
             function = short_linear_arm_function(
-                overlay_image, overlay.ram_address, target
+                overlay_image, overlay.ram_address, target, 64
             )
             if function is not None:
                 variants.append((function, {}))
@@ -1131,7 +1237,6 @@ def write_translator(
             "            return nds_cpu_trap(cpu, result, pc, nds_read32(cpu, pc));",
             "        if (result != NDS_RUN_BUDGET_EXHAUSTED)",
             "            return result;",
-            "        nds_poll_interrupts(cpu);",
             "    }",
             "    return nds_cpu_trap(cpu, NDS_RUN_BUDGET_EXHAUSTED, cpu->r[15], nds_read32(cpu, cpu->r[15]));",
             "}",
@@ -1228,12 +1333,14 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
     arm9_overlay_variants = referenced_overlay_variants(
         rom_path,
         read_overlay_table(rom_path, info.arm9_overlay_offset, info.arm9_overlay_size),
-        translation_image, info.arm9.ram_address, info.arm9.entry_address, instruction_limit,
+        translation_image, info.arm9.ram_address, info.arm9.entry_address,
+        instruction_limit, copies,
     )
     arm7_overlay_variants = referenced_overlay_variants(
         rom_path,
         read_overlay_table(rom_path, info.arm7_overlay_offset, info.arm7_overlay_size),
-        arm7, info.arm7.ram_address, info.arm7.entry_address, instruction_limit,
+        arm7, info.arm7.ram_address, info.arm7.entry_address,
+        instruction_limit, arm7_copies,
     )
     arm_translated, thumb_translated, aliases = write_translator(
         generated / "arm9_recomp.c", "arm9", translation_image,
@@ -1374,6 +1481,66 @@ def self_test() -> None:
         runner = (project / "generated" / "arm9_recomp.c").read_text(encoding="utf-8")
         assert "nds_exec_arm" not in runner
         assert "return nds_cpu_trap(cpu, result, pc" in runner
+
+        literal_leaf = bytearray(0x80)
+        struct.pack_into("<I", literal_leaf, 0, 0xE59F1058)
+        struct.pack_into("<I", literal_leaf, 0x5C, 0xE12FFF1E)
+        struct.pack_into("<I", literal_leaf, 0x70, 0x02000000)
+        assert (0x02000000, False) in find_function_roots(
+            bytes(literal_leaf), 0x02000000
+        )
+
+        indirect_leaf = bytearray(0x40)
+        struct.pack_into("<I", indirect_leaf, 0, 0xE12FFF1E)
+        struct.pack_into("<2I", indirect_leaf, 0x20, 0xE92D4010, 0xE8BD8010)
+        indirect_arm, _ = reachable_instructions(
+            bytes(indirect_leaf), 0x02000000, 0x02000000, 0
+        )
+        assert indirect_arm[0x02000020] == 0xE92D4010
+
+        long_indirect_leaf = bytearray(0x100)
+        long_indirect_target = 0x02000020
+        struct.pack_into("<I", long_indirect_leaf, 0, long_indirect_target)
+        for offset in range(0x20, 0xA8, 4):
+            struct.pack_into("<I", long_indirect_leaf, offset, 0xE1A00000)
+        struct.pack_into("<I", long_indirect_leaf, 0xA8, 0xE12FFF1E)
+        assert (long_indirect_target, False) in find_function_roots(
+            bytes(long_indirect_leaf), 0x02000000, 256
+        )
+        assert short_linear_arm_function(
+            bytes(long_indirect_leaf), 0x02000000,
+            long_indirect_target, 64,
+        ) is not None
+
+        chain_rom = root / "overlay-chain.nds"
+        chain_data = bytearray(0x300)
+        main_base = 0x02000000
+        first_base = 0x02001000
+        second_base = 0x02002000
+        main_target = main_base + 0x20
+        copy_base = 0x01FFF000
+        main_branch = 0xEA000000 | (((first_base - (copy_base + 8)) // 4) & 0xFFFFFF)
+        struct.pack_into("<2I", chain_data, 0, 0xE12FFF1E, main_branch)
+        struct.pack_into("<2I", chain_data, 0x20, 0xE3A00001, 0xE12FFF1E)
+        struct.pack_into(
+            "<4I", chain_data, 0x100,
+            0xE59FC000, 0xE12FFF1C, second_base, 0xE12FFF1E,
+        )
+        struct.pack_into(
+            "<4I", chain_data, 0x200,
+            0xE59FC000, 0xE12FFF1C, main_target, 0xE12FFF1E,
+        )
+        chain_rom.write_bytes(chain_data)
+        overlay_variants = referenced_overlay_variants(
+            chain_rom,
+            [
+                Overlay(first_base, 16, 0, 0, 0x100, 16),
+                Overlay(second_base, 16, 0, 0, 0x200, 16),
+            ],
+            bytes(chain_data[:0x28]), main_base, main_base, 0,
+            [{"source": main_base + 4, "destination": copy_base, "size": 4}],
+        )
+        assert any(arm.get(main_target) == 0xE3A00001 for arm, _ in overlay_variants)
     print("ndsrecomp generator self-test: OK")
 
 

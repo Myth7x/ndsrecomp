@@ -98,6 +98,7 @@ static int gx_port_command(uint32_t address) {
     return -1;
 }
 #define IRQ_IPC_RECV (UINT32_C(1) << 18)
+#define IRQ_GXFIFO (UINT32_C(1) << 21)
 #define IRQ_VBLANK UINT32_C(1)
 #define IRQ_HBLANK (UINT32_C(1) << 1)
 #define IRQ_VCOUNT (UINT32_C(1) << 2)
@@ -392,6 +393,14 @@ static bool vram_bank_address(const NdsCpu *cpu, unsigned bank, uint32_t address
     return false;
 }
 
+const uint8_t *nds_vram_bank_pointer(const NdsCpu *cpu, unsigned bank,
+                                     uint32_t address) {
+    uint32_t physical;
+    if (bank >= 9u || !vram_bank_address(cpu, bank, address, &physical))
+        return NULL;
+    return cpu->vram + physical;
+}
+
 static uint8_t vram_read8(const NdsCpu *cpu, uint32_t address) {
     uint8_t value = 0u;
     for (unsigned bank = 0; bank < 9u; ++bank) {
@@ -418,6 +427,16 @@ static void raise_irq(NdsCpu *cpu, uint32_t irq) {
         const uint32_t pending = nds_read32(cpu, REG_IF) | irq;
         memcpy(flags, &pending, sizeof(pending));
     }
+}
+
+static void update_gxfifo_irq(NdsCpu *cpu) {
+    if (cpu->cpu_id != 9u || cpu->gpu == NULL)
+        return;
+    const uint32_t status = nds_gpu_read_status(cpu->gpu);
+    const unsigned mode = (status >> 30) & 3u;
+    if ((mode == 1u && status & (UINT32_C(1) << 25)) ||
+        (mode == 2u && status & (UINT32_C(1) << 26)))
+        raise_irq(cpu, IRQ_GXFIFO);
 }
 
 static bool initialize_save_memory(NdsCpu *cpu, const char *rom_path) {
@@ -1406,6 +1425,7 @@ void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value) {
 }
 
 void nds_poll_interrupts(NdsCpu *cpu) {
+    update_gxfifo_irq(cpu);
     if (cpu->cpsr & (UINT32_C(1) << 7))
         return;
     if (!(nds_read32(cpu, REG_IME) & 1u))
@@ -1489,6 +1509,10 @@ static void run_dma(NdsCpu *cpu, uint32_t control_address, uint32_t control) {
         data[1] = (uint8_t)(complete >> 8);
         data[2] = (uint8_t)(complete >> 16);
         data[3] = (uint8_t)(complete >> 24);
+    }
+    if (control & (UINT32_C(1) << 30)) {
+        const unsigned channel = (control_address - UINT32_C(0x040000b8)) / 12u;
+        raise_irq(cpu, UINT32_C(1) << (8u + channel));
     }
 }
 

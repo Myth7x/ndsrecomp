@@ -97,6 +97,8 @@ bool nds_condition(const NdsCpu *cpu, unsigned condition);
 bool nds_cpu_is_thumb(const NdsCpu *cpu);
 void nds_poll_interrupts(NdsCpu *cpu);
 bool nds_finish_interrupt(NdsCpu *cpu);
+const uint8_t *nds_vram_bank_pointer(const NdsCpu *cpu, unsigned bank,
+                                     uint32_t address);
 uint8_t nds_read8(const NdsCpu *cpu, uint32_t address);
 uint16_t nds_read16(const NdsCpu *cpu, uint32_t address);
 uint32_t nds_read32(const NdsCpu *cpu, uint32_t address);
