@@ -56,6 +56,8 @@ void easygl2d_present(void);
 void easygl2d_shutdown(void);
 const uint32_t *easygl2d_framebuffer(void);
 uint64_t easygl2d_framebuffer_hash(void);
+bool easygl2d_dump_framebuffer(const char *path);
+void easygl2d_apply_brightness(int screen_y, uint16_t control);
 
 void glScreen2D(void);
 void glBegin2D(void);

@@ -78,6 +78,8 @@ typedef struct NdsCpuTag {
     uint8_t *palette;
     uint8_t *vram;
     uint8_t *oam;
+    uint16_t *display_fifo;
+    size_t display_fifo_position;
     uint8_t *wram;
     uint8_t *save_data;
     size_t save_size;

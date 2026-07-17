@@ -1,6 +1,7 @@
 #include "arm9_recomp.h"
 #include "easygl2d.h"
 #include "nds_video.h"
+#include "nds_gpu.h"
 #include "rom_config.h"
 
 #include <SDL3/SDL.h>
@@ -20,6 +21,20 @@ static const char *result_name(NdsRunResult result) {
     case NDS_RUN_MEMORY_ERROR: return "memory error";
     }
     return "unknown";
+}
+
+static unsigned initialized_obj_count(const NdsCpu *cpu, unsigned engine) {
+    unsigned count = 0u;
+    for (unsigned object = 0; object < 128u; ++object) {
+        const uint32_t address = UINT32_C(0x07000000) + engine * 0x400u +
+                                 object * 8u;
+        const uint16_t attr0 = nds_read16(cpu, address);
+        const uint16_t attr1 = nds_read16(cpu, address + 2u);
+        const uint16_t attr2 = nds_read16(cpu, address + 4u);
+        if (attr0 != 0u || attr1 != 0u || attr2 != 0u)
+            count++;
+    }
+    return count;
 }
 
 static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
@@ -57,11 +72,15 @@ static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
 
 int main(int argc, char **argv) {
     bool self_test = false;
+    bool one_frame = false;
     const char *rom_path = NULL;
+    const char *dump_path = NULL;
     uint32_t step_limit = 0u;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--self-test") == 0) {
             self_test = true;
+        } else if (strcmp(argv[index], "--once") == 0) {
+            one_frame = true;
         } else if (strcmp(argv[index], "--rom") == 0 && index + 1 < argc) {
             rom_path = argv[++index];
         } else if (strcmp(argv[index], "--steps") == 0 && index + 1 < argc) {
@@ -72,8 +91,10 @@ int main(int argc, char **argv) {
                 return 2;
             }
             step_limit = (uint32_t)parsed;
+        } else if (strcmp(argv[index], "--dump-frame") == 0 && index + 1 < argc) {
+            dump_path = argv[++index];
         } else {
-            fprintf(stderr, "usage: %s [--self-test] [--rom path] [--steps count]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--self-test] [--once] [--rom path] [--steps count] [--dump-frame path]\n", argv[0]);
             return 2;
         }
     }
@@ -115,6 +136,7 @@ int main(int argc, char **argv) {
 
     NdsRunResult result = NDS_RUN_BUDGET_EXHAUSTED;
     NdsRunResult arm7_result = NDS_RUN_BUDGET_EXHAUSTED;
+    nds_gpu_begin_frame(cpu.gpu);
     bool running = run_steps(&cpu, &arm7, step_limit, &result, &arm7_result);
     nds_video_render(&cpu);
     EasyGL2DStats stats = {0};
@@ -126,6 +148,8 @@ int main(int argc, char **argv) {
     stats.vcount = nds_read16(&cpu, UINT32_C(0x04000006));
     easygl2d_set_stats(&stats);
     easygl2d_present();
+    if (dump_path != NULL && !easygl2d_dump_framebuffer(dump_path))
+        fprintf(stderr, "failed to dump framebuffer to %s\n", dump_path);
     printf("%s (%s): %u ARM9 instructions translated\n", NDS_GAME_CODE,
            NDS_ROM_TITLE, nds_arm9_translated_instruction_count);
     printf("ARM7: %u instructions translated; run: %s, pc=%08" PRIx32
@@ -207,6 +231,29 @@ int main(int argc, char **argv) {
            nds_read32(&cpu, UINT32_C(0x04000600)),
            nds_read16(&cpu, UINT32_C(0x0400006c)),
            nds_read16(&cpu, UINT32_C(0x0400106c)));
+    printf("vramcnt: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+           "  %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+           nds_read8(&cpu, UINT32_C(0x04000240)),
+           nds_read8(&cpu, UINT32_C(0x04000241)),
+           nds_read8(&cpu, UINT32_C(0x04000242)),
+           nds_read8(&cpu, UINT32_C(0x04000243)),
+           nds_read8(&cpu, UINT32_C(0x04000244)),
+           nds_read8(&cpu, UINT32_C(0x04000245)),
+           nds_read8(&cpu, UINT32_C(0x04000246)),
+           nds_read8(&cpu, UINT32_C(0x04000248)));
+    printf("gpu: commands=%" PRIu64 " triangles=%zu unsupported=%" PRIu64 "\n",
+           nds_gpu_command_count(cpu.gpu), nds_gpu_triangle_count(cpu.gpu),
+           nds_gpu_unsupported_count(cpu.gpu));
+    printf("gpu texture max=%u pixels\n", nds_gpu_max_texture_pixels(cpu.gpu));
+    printf("obj: initialized=%u/%u\n", initialized_obj_count(&cpu, 0u),
+           initialized_obj_count(&cpu, 1u));
+    fputs("gpu unsupported ids:", stdout);
+    for (unsigned command = 0; command < 256u; ++command) {
+        const uint32_t count = nds_gpu_command_histogram(cpu.gpu, command);
+        if (count != 0u)
+            printf(" %02x=%" PRIu32, command, count);
+    }
+    putchar('\n');
 
     if (self_test) {
         const uint64_t hash = easygl2d_framebuffer_hash();
@@ -215,6 +262,13 @@ int main(int argc, char **argv) {
         nds_cpu_destroy(&cpu);
         easygl2d_shutdown();
         return hash == 0 ? 1 : 0;
+    }
+
+    if (one_frame) {
+        nds_cpu_destroy(&arm7);
+        nds_cpu_destroy(&cpu);
+        easygl2d_shutdown();
+        return running ? 0 : 1;
     }
 
     uint64_t previous_frame_start = SDL_GetTicksNS();
@@ -232,6 +286,7 @@ int main(int argc, char **argv) {
         nds_write16(&arm7, UINT32_C(0x04000130), keys);
         nds_write16(&cpu, UINT32_C(0x04000136), extended_keys);
         nds_write16(&arm7, UINT32_C(0x04000136), extended_keys);
+        nds_gpu_begin_frame(cpu.gpu);
         running = run_steps(&cpu, &arm7, 560190u, &result, &arm7_result);
         const uint64_t emulation_end = SDL_GetTicksNS();
         nds_video_render(&cpu);

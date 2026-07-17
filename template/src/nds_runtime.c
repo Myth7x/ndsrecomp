@@ -2,6 +2,7 @@
 
 #include "rom_config.h"
 #include "rom_data.h"
+#include "nds_gpu.h"
 
 #include <limits.h>
 #include <math.h>
@@ -31,6 +32,7 @@
 #define VRAM_SIZE UINT32_C(0x000a4000)
 #define OAM_BASE UINT32_C(0x07000000)
 #define OAM_SIZE (2u * 1024u)
+#define DISPLAY_FIFO_PIXELS (256u * 192u)
 #define REG_IPCSYNC UINT32_C(0x04000180)
 #define REG_IPCFIFOCNT UINT32_C(0x04000184)
 #define REG_IPCFIFOSEND UINT32_C(0x04000188)
@@ -64,6 +66,37 @@
 #define NDS_HBLANK_CYCLES UINT32_C(1536)
 #define REG_IPCFIFORECV UINT32_C(0x04100000)
 #define REG_CARDDATA UINT32_C(0x04100010)
+#define REG_GXFIFO UINT32_C(0x04000400)
+#define REG_GXSTAT UINT32_C(0x04000600)
+#define REG_RAM_COUNT UINT32_C(0x04000604)
+#define REG_POS_RESULT UINT32_C(0x04000620)
+#define REG_VEC_RESULT UINT32_C(0x04000630)
+#define REG_DISP_MMEM_FIFO UINT32_C(0x04000068)
+#define REG_CLIP_MATRIX UINT32_C(0x04000640)
+#define REG_VECTOR_MATRIX UINT32_C(0x04000680)
+
+static int gx_port_command(uint32_t address) {
+    static const uint8_t commands[] = {
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c,
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2a, 0x2b,
+        0x30, 0x31, 0x32, 0x33, 0x34,
+        0x40, 0x41, 0x50, 0x60, 0x70, 0x71, 0x72
+    };
+    static const uint16_t offsets[] = {
+        0x440, 0x444, 0x448, 0x44c, 0x450, 0x454, 0x458, 0x45c,
+        0x460, 0x464, 0x468, 0x46c, 0x470,
+        0x480, 0x484, 0x488, 0x48c, 0x490, 0x494, 0x498, 0x49c, 0x4a0,
+        0x4a4, 0x4a8, 0x4ac,
+        0x4c0, 0x4c4, 0x4c8, 0x4cc, 0x4d0,
+        0x500, 0x504, 0x540, 0x580, 0x5c0, 0x5c4, 0x5c8
+    };
+    for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i)
+        if (address == UINT32_C(0x04000000) + offsets[i])
+            return commands[i];
+    return -1;
+}
 #define IRQ_IPC_RECV (UINT32_C(1) << 18)
 #define IRQ_VBLANK UINT32_C(1)
 #define IRQ_HBLANK (UINT32_C(1) << 1)
@@ -171,6 +204,19 @@ static bool vram_bank_address(const NdsCpu *cpu, unsigned bank, uint32_t address
     const unsigned offset = (control >> 3) & 3u;
     uint32_t relative;
 
+    /* LCDC mode exposes every bank at its fixed 0x06800000-based address,
+     * including E-I (texture-palette memory).  The old mapper only covered
+     * A-D here, so palette uploads to 0x06880000+ were discarded. */
+    if (mode == 0u) {
+        const uint32_t base = UINT32_C(0x06800000) +
+                              vram_bank_offsets[bank];
+        if (address >= base && address - base < vram_bank_sizes[bank]) {
+            *physical = vram_bank_offsets[bank] + address - base;
+            return true;
+        }
+        return false;
+    }
+
     if (cpu->cpu_id == 7u && address >= UINT32_C(0x06000000) &&
         address < UINT32_C(0x06040000)) {
         if ((bank == 2u || bank == 3u) && mode == 2u) {
@@ -184,15 +230,86 @@ static bool vram_bank_address(const NdsCpu *cpu, unsigned bank, uint32_t address
         return false;
     }
 
-    if (address >= UINT32_C(0x06800000) && address < UINT32_C(0x07000000)) {
-        if (mode != 0u)
-            return false;
-        relative = (address - UINT32_C(0x06800000)) & 0xfffffu;
-        const uint32_t base = vram_bank_offsets[bank];
-        const uint32_t size = vram_bank_sizes[bank];
-        if (relative >= base && relative - base < size) {
-            *physical = base + relative - base;
+    if (address >= UINT32_C(0x06800000) && address < UINT32_C(0x06880000)) {
+        relative = address - UINT32_C(0x06800000);
+        if (mode == 0u) {
+            const uint32_t base = vram_bank_offsets[bank];
+            const uint32_t size = vram_bank_sizes[bank];
+            if (relative >= base && relative - base < size) {
+                *physical = base + relative - base;
+                return true;
+            }
+        } else if (mode == 3u && bank <= 3u) {
+            const uint32_t base = offset * 0x20000u;
+            if (relative >= base && relative - base < 0x20000u) {
+                *physical = vram_bank_offsets[bank] + relative - base;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (address >= UINT32_C(0x06880000) && address < UINT32_C(0x06890000)) {
+        if (bank == 4u && mode == 3u) {
+            *physical = vram_bank_offsets[bank] + address - UINT32_C(0x06880000);
             return true;
+        }
+        if (bank == 4u && mode == 4u && address - UINT32_C(0x06880000) < 0x8000u) {
+            *physical = vram_bank_offsets[bank] + address - UINT32_C(0x06880000);
+            return true;
+        }
+        if ((bank == 5u || bank == 6u) && mode == 3u) {
+            const unsigned slot = (offset & 1u) + ((offset & 2u) ? 4u : 0u);
+            const uint32_t base = UINT32_C(0x06880000) + slot * 0x4000u;
+            if (address >= base && address - base < 0x4000u) {
+                *physical = vram_bank_offsets[bank] + address - base;
+                return true;
+            }
+        }
+        if ((bank == 5u || bank == 6u) && mode == 4u) {
+            const uint32_t base = (offset & 1u) * 0x4000u;
+            if (address >= UINT32_C(0x06880000) + base &&
+                address - (UINT32_C(0x06880000) + base) < 0x4000u) {
+                *physical = vram_bank_offsets[bank] +
+                            address - (UINT32_C(0x06880000) + base);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (address >= UINT32_C(0x06898000) && address < UINT32_C(0x068a0000) &&
+        bank == 7u && mode == 2u) {
+        *physical = vram_bank_offsets[bank] + address - UINT32_C(0x06898000);
+        return true;
+    }
+
+    /* OBJ extended palettes occupy 0x06890000-0x06897fff when banks F/G
+       select mode 5.  The old test lived inside the preceding interval,
+       which ends at 0x06890000 and could never match these addresses. */
+    if (address >= UINT32_C(0x06890000) && address < UINT32_C(0x06898000) &&
+        mode == 5u) {
+        if (bank == 5u && address < UINT32_C(0x06894000)) {
+            *physical = vram_bank_offsets[bank] +
+                        address - UINT32_C(0x06890000);
+            return true;
+        }
+        if (bank == 6u && address >= UINT32_C(0x06894000)) {
+            *physical = vram_bank_offsets[bank] +
+                        address - UINT32_C(0x06894000);
+            return true;
+        }
+        return false;
+    }
+
+    if (address >= UINT32_C(0x06880000) && address < UINT32_C(0x06898000)) {
+        if ((bank == 5u || bank == 6u) && mode == 3u) {
+            const unsigned slot = (offset & 1u) + ((offset & 2u) ? 4u : 0u);
+            const uint32_t base = UINT32_C(0x06880000) + slot * 0x4000u;
+            if (address >= base && address - base < 0x4000u) {
+                *physical = vram_bank_offsets[bank] + address - base;
+                return true;
+            }
         }
         return false;
     }
@@ -619,10 +736,13 @@ bool nds_cpu_init_arm9(NdsCpu *cpu, const char *rom_path) {
     cpu->palette = calloc(1, PALETTE_SIZE);
     cpu->vram = calloc(1, VRAM_SIZE);
     cpu->oam = calloc(1, OAM_SIZE);
+    cpu->display_fifo = calloc(DISPLAY_FIFO_PIXELS, sizeof(*cpu->display_fifo));
     cpu->rom_file = fopen(rom_path, "rb");
+    cpu->gpu = nds_gpu_create();
     if (cpu->itcm == NULL || cpu->dtcm == NULL || cpu->main_ram == NULL || cpu->io == NULL ||
         cpu->palette == NULL || cpu->vram == NULL || cpu->oam == NULL ||
-        cpu->rom_file == NULL || !initialize_save_memory(cpu, rom_path) ||
+        cpu->display_fifo == NULL ||
+        cpu->gpu == NULL || cpu->rom_file == NULL || !initialize_save_memory(cpu, rom_path) ||
         !initialize_direct_boot(cpu)) {
         nds_cpu_destroy(cpu);
         return false;
@@ -768,8 +888,12 @@ void nds_tick(NdsCpu *cpu, uint32_t cycles) {
         }
         if (entering_hblank && status & 0x10u)
             raise_irq(cpu, IRQ_HBLANK);
-        if (entering_vblank && status & 8u)
-            raise_irq(cpu, IRQ_VBLANK);
+        if (entering_vblank) {
+            if (cpu->cpu_id == 9u && cpu->gpu != NULL)
+                nds_gpu_vblank(cpu->gpu);
+            if (status & 8u)
+                raise_irq(cpu, IRQ_VBLANK);
+        }
         const uint16_t count = (uint16_t)next_line;
         memcpy(cpu->io + (REG_VCOUNT - IO_BASE), &count, sizeof(count));
         memcpy(cpu->io + (REG_DISPSTAT - IO_BASE), &status, sizeof(status));
@@ -813,6 +937,8 @@ void nds_tick(NdsCpu *cpu, uint32_t cycles) {
 }
 
 void nds_cpu_destroy(NdsCpu *cpu) {
+    nds_gpu_destroy(cpu->gpu);
+    cpu->gpu = NULL;
     free(cpu->io);
     free(cpu->wram);
     if (cpu->owns_save_memory) {
@@ -827,6 +953,7 @@ void nds_cpu_destroy(NdsCpu *cpu) {
         free(cpu->palette);
         free(cpu->vram);
         free(cpu->oam);
+        free(cpu->display_fifo);
         if (cpu->rom_file != NULL)
             fclose(cpu->rom_file);
     }
@@ -837,6 +964,8 @@ void nds_cpu_destroy(NdsCpu *cpu) {
     cpu->palette = NULL;
     cpu->vram = NULL;
     cpu->oam = NULL;
+    cpu->display_fifo = NULL;
+    cpu->display_fifo_position = 0u;
     cpu->wram = NULL;
     cpu->save_data = NULL;
     cpu->save_path = NULL;
@@ -887,6 +1016,35 @@ uint8_t nds_read8(const NdsCpu *cpu, uint32_t address) {
 }
 
 uint16_t nds_read16(const NdsCpu *cpu, uint32_t address) {
+    if (cpu->cpu_id == 9u && address >= REG_RAM_COUNT &&
+        address < REG_RAM_COUNT + 4u) {
+        const uint32_t result = nds_gpu_read_ram_count(cpu->gpu);
+        return (uint16_t)(result >> ((address & 2u) * 8u));
+    }
+    if (cpu->cpu_id == 9u && address >= REG_POS_RESULT &&
+        address < REG_POS_RESULT + 16u) {
+        const uint32_t result = nds_gpu_read_position_result(cpu->gpu,
+            (address - REG_POS_RESULT) / 4u);
+        return (uint16_t)(result >> ((address & 2u) * 8u));
+    }
+    if (cpu->cpu_id == 9u && address >= REG_VEC_RESULT &&
+        address < REG_VEC_RESULT + 6u)
+        return nds_gpu_read_vector_result(cpu->gpu,
+                                          (address - REG_VEC_RESULT) / 2u);
+    if (cpu->cpu_id == 9u && address == REG_GXSTAT)
+        return (uint16_t)nds_gpu_read_status(cpu->gpu);
+    if (cpu->cpu_id == 9u && address >= REG_CLIP_MATRIX &&
+        address < REG_CLIP_MATRIX + 64u) {
+        const uint32_t result = nds_gpu_read_clip_matrix(cpu->gpu,
+            (address - REG_CLIP_MATRIX) / 4u);
+        return (uint16_t)(result >> ((address & 2u) * 8u));
+    }
+    if (cpu->cpu_id == 9u && address >= REG_VECTOR_MATRIX &&
+        address < REG_VECTOR_MATRIX + 36u) {
+        const uint32_t result = nds_gpu_read_vector_matrix(cpu->gpu,
+            (address - REG_VECTOR_MATRIX) / 4u);
+        return (uint16_t)(result >> ((address & 2u) * 8u));
+    }
     if (address == REG_IPCFIFOCNT) {
         uint16_t value = (uint16_t)(nds_read8(cpu, address) |
                                     ((uint16_t)nds_read8(cpu, address + 1u) << 8));
@@ -902,6 +1060,27 @@ uint16_t nds_read16(const NdsCpu *cpu, uint32_t address) {
 }
 
 uint32_t nds_read32(const NdsCpu *cpu, uint32_t address) {
+    if (cpu->cpu_id == 9u && address == REG_GXSTAT)
+        return nds_gpu_read_status(cpu->gpu);
+    if (cpu->cpu_id == 9u && address == REG_RAM_COUNT)
+        return nds_gpu_read_ram_count(cpu->gpu);
+    if (cpu->cpu_id == 9u && address >= REG_POS_RESULT &&
+        address < REG_POS_RESULT + 16u && (address & 3u) == 0u)
+        return nds_gpu_read_position_result(cpu->gpu,
+                                             (address - REG_POS_RESULT) / 4u);
+    if (cpu->cpu_id == 9u && address == REG_VEC_RESULT)
+        return (uint32_t)nds_gpu_read_vector_result(cpu->gpu, 0u) |
+               ((uint32_t)nds_gpu_read_vector_result(cpu->gpu, 1u) << 16);
+    if (cpu->cpu_id == 9u && address == REG_VEC_RESULT + 4u)
+        return nds_gpu_read_vector_result(cpu->gpu, 2u);
+    if (cpu->cpu_id == 9u && address >= REG_CLIP_MATRIX &&
+        address < REG_CLIP_MATRIX + 64u && (address & 3u) == 0u)
+        return nds_gpu_read_clip_matrix(cpu->gpu,
+                                        (address - REG_CLIP_MATRIX) / 4u);
+    if (cpu->cpu_id == 9u && address >= REG_VECTOR_MATRIX &&
+        address < REG_VECTOR_MATRIX + 36u && (address & 3u) == 0u)
+        return nds_gpu_read_vector_matrix(cpu->gpu,
+                                          (address - REG_VECTOR_MATRIX) / 4u);
     if (address == REG_IPCFIFORECV) {
         NdsCpu *mutable = (NdsCpu *)cpu;
         uint32_t value = mutable->fifo_word;
@@ -1090,6 +1269,10 @@ void nds_write8(NdsCpu *cpu, uint32_t address, uint8_t value) {
 }
 
 void nds_write16(NdsCpu *cpu, uint32_t address, uint16_t value) {
+    if (cpu->cpu_id == 9u && address == REG_GXSTAT) {
+        nds_gpu_write_status(cpu->gpu, value);
+        return;
+    }
     if (address == REG_AUXSPICNT && cpu->backup_selected &&
         (nds_read16(cpu, address) & 0x2000u) && !(value & 0x2000u))
         backup_release(cpu);
@@ -1139,6 +1322,31 @@ void nds_write16(NdsCpu *cpu, uint32_t address, uint16_t value) {
 
 void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value) {
     const uint32_t aligned = address & ~3u;
+    if (cpu->cpu_id == 9u && aligned == REG_DISP_MMEM_FIFO &&
+        cpu->display_fifo != NULL) {
+        cpu->display_fifo[cpu->display_fifo_position % DISPLAY_FIFO_PIXELS] =
+            (uint16_t)value;
+        cpu->display_fifo[(cpu->display_fifo_position + 1u) % DISPLAY_FIFO_PIXELS] =
+            (uint16_t)(value >> 16);
+        cpu->display_fifo_position =
+            (cpu->display_fifo_position + 2u) % DISPLAY_FIFO_PIXELS;
+        return;
+    }
+    if (cpu->cpu_id == 9u && aligned == REG_GXSTAT) {
+        nds_gpu_write_status(cpu->gpu, value);
+        return;
+    }
+    if (cpu->cpu_id == 9u && aligned == REG_GXFIFO) {
+        nds_gpu_write32(cpu->gpu, value);
+        return;
+    }
+    if (cpu->cpu_id == 9u) {
+        const int command = gx_port_command(aligned);
+        if (command >= 0) {
+            nds_gpu_write_port(cpu->gpu, (uint8_t)command, value);
+            return;
+        }
+    }
     nds_write16(cpu, aligned, (uint16_t)value);
     nds_write16(cpu, aligned + 2u, (uint16_t)(value >> 16));
     if (aligned == REG_ROMCTRL && value & UINT32_C(0x80000000)) {

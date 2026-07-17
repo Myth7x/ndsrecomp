@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -172,9 +173,14 @@ static uint32_t rgba15(int color) {
     const unsigned r5 = (unsigned)color & 31u;
     const unsigned g5 = ((unsigned)color >> 5) & 31u;
     const unsigned b5 = ((unsigned)color >> 10) & 31u;
-    const uint32_t r = (r5 * 255u + 15u) / 31u;
-    const uint32_t g = (g5 * 255u + 15u) / 31u;
-    const uint32_t b = (b5 * 255u + 15u) / 31u;
+    /* 2D palette pixels are expanded through the DS's 6-bit internal
+       pipeline: 5-bit palette component -> 6-bit component -> 8-bit host. */
+    const uint32_t r6 = r5 * 2u;
+    const uint32_t g6 = g5 * 2u;
+    const uint32_t b6 = b5 * 2u;
+    const uint32_t r = r6 * 4u + r6 / 16u;
+    const uint32_t g = g6 * 4u + g6 / 16u;
+    const uint32_t b = b6 * 4u + b6 / 16u;
     return (r << 24) | (g << 16) | (b << 8) | 0xffu;
 }
 
@@ -188,6 +194,7 @@ bool easygl2d_init(const char *title, int scale, bool headless) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
     if (scale < 1)
         scale = 1;
     if (!SDL_CreateWindowAndRenderer(title, EASYGL2D_WINDOW_WIDTH * scale,
@@ -319,6 +326,82 @@ uint64_t easygl2d_framebuffer_hash(void) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+bool easygl2d_dump_framebuffer(const char *path) {
+    if (path == NULL)
+        return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL)
+        return false;
+    const uint32_t file_size = 54u + EASYGL2D_WIDTH * EASYGL2D_HEIGHT * 3u;
+    const uint32_t dib_size = 40u;
+    const int32_t width = EASYGL2D_WIDTH;
+    const int32_t height = EASYGL2D_HEIGHT;
+    const uint16_t planes = 1u;
+    const uint16_t bits = 24u;
+    fwrite("BM", 2u, 1u, file);
+    fwrite(&file_size, sizeof(file_size), 1u, file);
+    const uint32_t reserved = 0u;
+    fwrite(&reserved, sizeof(reserved), 1u, file);
+    const uint32_t pixel_offset = 54u;
+    fwrite(&pixel_offset, sizeof(pixel_offset), 1u, file);
+    fwrite(&dib_size, sizeof(dib_size), 1u, file);
+    fwrite(&width, sizeof(width), 1u, file);
+    fwrite(&height, sizeof(height), 1u, file);
+    fwrite(&planes, sizeof(planes), 1u, file);
+    fwrite(&bits, sizeof(bits), 1u, file);
+    const uint32_t compression = 0u;
+    const uint32_t image_size = EASYGL2D_WIDTH * EASYGL2D_HEIGHT * 3u;
+    const int32_t resolution = 2835;
+    const uint32_t colors = 0u;
+    fwrite(&compression, sizeof(compression), 1u, file);
+    fwrite(&image_size, sizeof(image_size), 1u, file);
+    fwrite(&resolution, sizeof(resolution), 1u, file);
+    fwrite(&resolution, sizeof(resolution), 1u, file);
+    fwrite(&colors, sizeof(colors), 1u, file);
+    fwrite(&colors, sizeof(colors), 1u, file);
+    for (int y = EASYGL2D_HEIGHT - 1; y >= 0; --y) {
+        for (unsigned x = 0; x < EASYGL2D_WIDTH; ++x) {
+            const uint32_t color = framebuffer[y * EASYGL2D_WIDTH + x];
+            const uint8_t bgr[3] = {
+                (uint8_t)(color >> 8), (uint8_t)(color >> 16),
+                (uint8_t)(color >> 24)
+            };
+            if (fwrite(bgr, sizeof(bgr), 1u, file) != 1u) {
+                fclose(file);
+                return false;
+            }
+        }
+    }
+    return fclose(file) == 0;
+}
+
+void easygl2d_apply_brightness(int screen_y, uint16_t control) {
+    const unsigned mode = (control >> 14) & 3u;
+    const unsigned intensity = control & 31u;
+    if (mode != 1u && mode != 2u)
+        return;
+    const unsigned amount = intensity > 16u ? 16u : intensity;
+    for (unsigned y = 0; y < 192u; ++y) {
+        uint32_t *row = framebuffer + (screen_y + (int)y) * EASYGL2D_WIDTH;
+        for (unsigned x = 0; x < EASYGL2D_WIDTH; ++x) {
+            uint32_t color = row[x];
+            unsigned r = color >> 24;
+            unsigned g = (color >> 16) & 255u;
+            unsigned b = (color >> 8) & 255u;
+            if (mode == 1u) {
+                r += (255u - r) * amount / 16u;
+                g += (255u - g) * amount / 16u;
+                b += (255u - b) * amount / 16u;
+            } else {
+                r -= r * amount / 16u;
+                g -= g * amount / 16u;
+                b -= b * amount / 16u;
+            }
+            row[x] = (r << 24) | (g << 16) | (b << 8) | (color & 255u);
+        }
+    }
 }
 
 void glScreen2D(void) {
