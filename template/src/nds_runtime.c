@@ -1285,12 +1285,25 @@ void nds_write8(NdsCpu *cpu, uint32_t address, uint8_t value) {
                 response = (uint8_t)(cpu->touch_result << 3);
             if (value & 0x80u) {
                 cpu->touch_phase = 1u;
-                if ((value & 0x70u) == 0x10u)
+                switch (value & 0x70u) {
+                case 0x10u: /* Y position */
                     cpu->touch_result = cpu->touch_y;
-                else if ((value & 0x70u) == 0x50u)
+                    break;
+                case 0x30u: /* Z1 pressure */
+                    cpu->touch_result = cpu->touch_y == UINT16_C(0x0fff) ?
+                        0u : UINT16_C(0x0400);
+                    break;
+                case 0x40u: /* Z2 pressure */
+                    cpu->touch_result = cpu->touch_y == UINT16_C(0x0fff) ?
+                        0u : UINT16_C(0x0800);
+                    break;
+                case 0x50u: /* X position */
                     cpu->touch_result = cpu->touch_x;
-                else
+                    break;
+                default:
                     cpu->touch_result = UINT16_C(0x0fff);
+                    break;
+                }
                 if (value & 8u)
                     cpu->touch_result &= UINT16_C(0x0ff0);
             } else {

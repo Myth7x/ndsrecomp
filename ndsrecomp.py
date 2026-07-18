@@ -236,6 +236,25 @@ def write_bytes_if_changed(output: Path, content: bytes) -> None:
     output.write_bytes(content)
 
 
+def sync_template(output: Path) -> None:
+    """Copy runtime sources without touching unchanged mtimes.
+
+    A normal copytree refresh makes every dependent object look newer after
+    each `create`, even when the template bytes did not change.  Generated
+    projects are large enough that preserving mtimes is material to rebuild
+    time, so use the same content-aware write path as generated files.
+    """
+    for source in TEMPLATE_DIR.rglob("*"):
+        target = output / source.relative_to(TEMPLATE_DIR)
+        if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif source.is_file():
+            write_bytes_if_changed(target, source.read_bytes())
+            source_mode = source.stat().st_mode & 0o777
+            if target.stat().st_mode & 0o777 != source_mode:
+                target.chmod(source_mode)
+
+
 def write_byte_array(output: Path, name: str, data: bytes) -> None:
     lines = ['#include "rom_data.h"', "", f"const uint8_t {name}[] = {{"]
     for offset in range(0, len(data), 16):
@@ -1354,7 +1373,7 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
         previous_sha256 = previous_manifest.get("rom", {}).get("sha256")
 
     output.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(TEMPLATE_DIR, output, dirs_exist_ok=True)
+    sync_template(output)
     generated = output / "generated"
     rom_dir = output / "rom"
     generated.mkdir(exist_ok=True)
@@ -1494,12 +1513,13 @@ Generated from `{info.title}`. The source ROM is packaged as `rom/game.nds` so
 the runtime can service cartridge reads for overlays and game assets.
 
 ```sh
-cmake -S . -B build-linux -G Ninja
-cmake --build build-linux
-./build-linux/ndsrecomp --self-test
+./compile.sh
+./start.sh --self-test
 ```
 
-Reuse the same build directory for incremental rebuilds. New projects group
+Reuse the same build directory for incremental rebuilds. Set
+`NDSRECOMP_BUILD_DIR` to use another build location and
+`NDSRECOMP_BUILD_JOBS` to limit parallel compiler jobs. New projects group
 generated translation units in small unity files for clean builds. CMake also
 uses ccache or sccache automatically when installed; disable grouping with
 `-DNDSRECOMP_UNITY_BUILD=OFF` or tune `NDSRECOMP_UNITY_BATCH_SIZE` and

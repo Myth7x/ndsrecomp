@@ -5,6 +5,7 @@
 #include <SDL3/SDL_opengl.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define GPU_MAX_TRIANGLES 65536u
@@ -694,11 +695,13 @@ static bool append_triangle(NdsGpu *gpu, const GpuVertex *a,
     for (unsigned vertex = 0; vertex < count; ++vertex) {
         int64_t raw_w = llround((double)input[vertex].clip[3] * 4096.0);
         if (raw_w < 0) raw_w = 0;
-        int64_t shifted_w = wsize < 16u ? raw_w :
-            (raw_w >> (wsize - 16u)) << (wsize - 16u);
-        input[vertex].depth = (float)((double)shifted_w / 16777215.0);
-        if (input[vertex].depth > 1.0f)
-            input[vertex].depth = 1.0f;
+        /* DS W-buffering normalizes W independently for each polygon to a
+         * 16-bit value.  Preserve that normalized value for the host depth
+         * buffer; using the absolute W makes every polygon compare at the
+         * wrong depth and hides otherwise valid geometry. */
+        const int64_t normalized_w = wsize < 16u ?
+            raw_w << (16u - wsize) : raw_w >> (wsize - 16u);
+        input[vertex].depth = (float)((double)normalized_w / 65535.0);
     }
     for (unsigned index = 1u; index + 1u < count; ++index) {
         update_viewport_vertex(gpu, &input[0]);
@@ -842,6 +845,21 @@ static bool upload_texture(const NdsCpu *cpu, const GpuTriangle *triangle,
                                  width, x, y) :
                 texture_texel(cpu, triangle->texture, triangle->palette,
                               format, width, x, y);
+    static bool debug_texture_dumped;
+    if (!debug_texture_dumped && format == 5u) {
+        FILE *file = fopen("/tmp/sm64-texture.ppm", "wb");
+        if (file != NULL) {
+            fprintf(file, "P6\n%u %u\n255\n", width, height);
+            for (size_t index = 0; index < (size_t)width * height; ++index) {
+                const uint32_t color = pixels[index];
+                fputc((int)(color >> 24), file);
+                fputc((int)(color >> 16), file);
+                fputc((int)(color >> 8), file);
+            }
+            fclose(file);
+        }
+        debug_texture_dumped = true;
+    }
     glBindTexture(GL_TEXTURE_2D, texture_name);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1357,6 +1375,36 @@ void nds_gpu_write_port(NdsGpu *gpu, uint8_t command, uint32_t value) {
 
 void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
     const NdsGpu *gpu = cpu == NULL ? NULL : cpu->gpu;
+    static bool debug_triangles_logged;
+    if (!debug_triangles_logged && gpu != NULL &&
+        gpu->visible_triangle_count != 0u) {
+        for (size_t index = 0; index < gpu->visible_triangle_count; ++index) {
+            const GpuTriangle *triangle = &gpu->visible_triangles[index];
+            float min_z = 2.0f, max_z = -2.0f;
+            float min_depth = 2.0f, max_depth = -2.0f;
+            float min_x = 2.0f, max_x = -2.0f;
+            float min_y = 2.0f, max_y = -2.0f;
+            for (unsigned vertex = 0u; vertex < 3u; ++vertex) {
+                const GpuVertex *point = &triangle->vertex[vertex];
+                if (point->z < min_z) min_z = point->z;
+                if (point->z > max_z) max_z = point->z;
+                if (point->depth < min_depth) min_depth = point->depth;
+                if (point->depth > max_depth) max_depth = point->depth;
+                if (point->x < min_x) min_x = point->x;
+                if (point->x > max_x) max_x = point->x;
+                if (point->y < min_y) min_y = point->y;
+                if (point->y > max_y) max_y = point->y;
+            }
+            fprintf(stderr, "tri %zu poly=%08x tex=%08x fmt=%u alpha=%u "
+                            "wb=%u z=%g..%g d=%g..%g xy=%g,%g..%g,%g\n",
+                    index, triangle->polygon, triangle->texture,
+                    (triangle->texture >> 26) & 7u,
+                    (triangle->polygon >> 16) & 31u,
+                    triangle->w_buffer ? 1u : 0u, min_z, max_z,
+                    min_depth, max_depth, min_x, min_y, max_x, max_y);
+        }
+        debug_triangles_logged = true;
+    }
     if (gpu == NULL || !easygl2d_gl_begin())
         return;
     NdsGpu *cache_gpu = (NdsGpu *)gpu;
@@ -1543,7 +1591,7 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
         } else {
             const bool equal_depth = (triangle->polygon & (1u << 14)) != 0u;
             glDepthFunc(rear_plane ? GL_ALWAYS :
-                        (equal_depth ? GL_EQUAL : GL_LESS));
+                        (equal_depth ? GL_EQUAL : GL_LEQUAL));
             glDepthMask(!rear_plane && (polygon_alpha == 31u ||
                         (triangle->polygon & (1u << 11)) != 0u));
         }

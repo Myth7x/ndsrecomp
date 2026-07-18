@@ -10,6 +10,20 @@ current milestone produces Linux x86-64 ELF and Windows x86-64 EXE diagnostic
 runtimes. Some ROMs boot far enough to exercise CPU, memory, video, and input
 paths, but arbitrary retail games do not yet reach gameplay.
 
+## ROMs tested
+
+| ROM | BOOT | GAMEPLAY | GRAPHICS | AUDIO | INPUT | NOTES |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0102 - Nintendogs - Labrador & Friends (Europe) (En,Fr,De,Es,It) | ✅ | ❌ | ❌ | ❌ | ❌ | Wrong EEPROM implementation causes being stuck |
+| 5585 - Pokemon - Black Version (USA, Europe) (NDSi Enhanced) [b] | ❌ | ❌ | ❌ | ❌ | ❌ | - |
+| Advance Wars - Dual Strike (USA, Australia) | ❌ | ❌ | ❌ | ❌ | ❌ | - |
+| Chrono Trigger (USA) (En,Fr) | ✅ | ❌ | ❌ | ❌ | ❌ | - |
+| Mario & Luigi - Bowser's Inside Story (Europe) (En,Fr,De,Es,It)_apfix | ❌ | ❌ | ❌ | ❌ | ❌ | - |
+| Mario Kart DS (USA, Australia) (En,Fr,De,Es,It) | ❌ | ❌ | ❌ | ❌ | ❌ | - |
+| New Super Mario Bros. (USA, Australia) | ✅ | ❌ | ❌ | ❌ | ❌ | - |
+| Pokémon - Black Version 2 (USA, Europe) (NDSi Enhanced) | ❌ | ❌ | ❌ | ❌ | ❌ | - |
+| Super Mario 64 DS (USA, Australia) (Rev 1) | ✅ | ❌ | ❌ | ❌ | ❌ | - |
+
 ## Quick start
 
 Requirements:
@@ -33,6 +47,18 @@ Generate a project. By default, a ROM named `game.nds` becomes
 ```sh
 python3 ndsrecomp.py create path/to/game.nds
 ```
+
+Generated projects include `compile.sh` and `start.sh`, so after creation the
+usual workflow is:
+
+```sh
+cd output/game/native
+./compile.sh
+./start.sh --self-test
+```
+
+Set `NDSRECOMP_BUILD_DIR` to choose another build directory or
+`NDSRECOMP_BUILD_JOBS` to limit parallel compiler jobs.
 
 Build and run its deterministic headless self-test:
 

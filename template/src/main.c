@@ -92,6 +92,11 @@ int main(int argc, char **argv) {
     const char *dump_path = NULL;
     uint32_t step_limit = 0u;
     uint32_t frame_limit = 0u;
+    bool scripted_touch = false;
+    uint16_t scripted_touch_x = 0u;
+    uint16_t scripted_touch_y = 0u;
+    uint32_t scripted_tap_frame = UINT32_MAX;
+    uint32_t scripted_tap_end_frame = UINT32_MAX;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--self-test") == 0) {
             self_test = true;
@@ -118,8 +123,43 @@ int main(int argc, char **argv) {
             frame_limit = (uint32_t)parsed;
         } else if (strcmp(argv[index], "--dump-frame") == 0 && index + 1 < argc) {
             dump_path = argv[++index];
+        } else if (strcmp(argv[index], "--tap") == 0 && index + 2 < argc) {
+            char *x_end = NULL;
+            char *y_end = NULL;
+            const unsigned long x = strtoul(argv[++index], &x_end, 10);
+            const unsigned long y = strtoul(argv[++index], &y_end, 10);
+            if (x_end == argv[index - 1] || *x_end != '\0' ||
+                y_end == argv[index] || *y_end != '\0' ||
+                x >= 256u || y >= 192u) {
+                fprintf(stderr, "invalid --tap coordinates\n");
+                return 2;
+            }
+            scripted_touch = true;
+            scripted_touch_x = (uint16_t)x;
+            scripted_touch_y = (uint16_t)y;
+        } else if (strcmp(argv[index], "--tap-frame") == 0 && index + 3 < argc) {
+            char *frame_end = NULL;
+            char *x_end = NULL;
+            char *y_end = NULL;
+            const unsigned long frame = strtoul(argv[++index], &frame_end, 10);
+            const unsigned long x = strtoul(argv[++index], &x_end, 10);
+            const unsigned long y = strtoul(argv[++index], &y_end, 10);
+            if (frame_end == argv[index - 2] || *frame_end != '\0' ||
+                x_end == argv[index - 1] || *x_end != '\0' ||
+                y_end == argv[index] || *y_end != '\0' ||
+                frame >= UINT32_MAX || x >= 256u || y >= 192u) {
+                fprintf(stderr, "invalid --tap-frame arguments\n");
+                return 2;
+            }
+            scripted_touch = true;
+            scripted_tap_frame = (uint32_t)frame;
+            scripted_tap_end_frame = scripted_tap_frame + 120u;
+            if (scripted_tap_end_frame < scripted_tap_frame)
+                scripted_tap_end_frame = UINT32_MAX;
+            scripted_touch_x = (uint16_t)x;
+            scripted_touch_y = (uint16_t)y;
         } else {
-            fprintf(stderr, "usage: %s [--self-test] [--once] [--frames count] [--rom path] [--steps count] [--dump-frame path]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--self-test] [--once] [--frames count] [--rom path] [--steps count] [--dump-frame path] [--tap x y] [--tap-frame frame x y]\n", argv[0]);
             return 2;
         }
     }
@@ -165,6 +205,10 @@ int main(int argc, char **argv) {
 
     NdsRunResult result = NDS_RUN_BUDGET_EXHAUSTED;
     NdsRunResult arm7_result = NDS_RUN_BUDGET_EXHAUSTED;
+    if (scripted_touch && scripted_tap_frame == UINT32_MAX) {
+        nds_set_touch(&cpu, true, scripted_touch_x, scripted_touch_y);
+        nds_set_touch(&arm7, true, scripted_touch_x, scripted_touch_y);
+    }
     nds_gpu_begin_frame(cpu.gpu);
     bool running = run_steps(&cpu, &arm7, step_limit, &result, &arm7_result);
     nds_video_render(&cpu);
@@ -309,12 +353,18 @@ int main(int argc, char **argv) {
         const uint64_t arm7_before = arm7.instructions_executed;
         const uint16_t keys = easygl2d_keyinput();
         const uint16_t extended_keys = easygl2d_extkeyin();
-        nds_set_touch(&cpu, easygl2d_touching(), easygl2d_touch_x(), easygl2d_touch_y());
-        nds_set_touch(&arm7, easygl2d_touching(), easygl2d_touch_x(), easygl2d_touch_y());
+        const bool touching = scripted_touch ?
+            (scripted_tap_frame == UINT32_MAX ||
+             (stats.frame >= scripted_tap_frame &&
+              stats.frame < scripted_tap_end_frame)) : easygl2d_touching();
+        const uint16_t touch_x = scripted_touch ? scripted_touch_x : easygl2d_touch_x();
+        const uint16_t touch_y = scripted_touch ? scripted_touch_y : easygl2d_touch_y();
         nds_write16(&cpu, UINT32_C(0x04000130), keys);
         nds_write16(&arm7, UINT32_C(0x04000130), keys);
         nds_write16(&cpu, UINT32_C(0x04000136), extended_keys);
         nds_write16(&arm7, UINT32_C(0x04000136), extended_keys);
+        nds_set_touch(&cpu, touching, touch_x, touch_y);
+        nds_set_touch(&arm7, touching, touch_x, touch_y);
         nds_gpu_begin_frame(cpu.gpu);
         running = run_steps(&cpu, &arm7, 560190u, &result, &arm7_result);
         const uint64_t emulation_end = SDL_GetTicksNS();
