@@ -16,6 +16,7 @@ from pathlib import Path
 
 
 TEMPLATE_DIR = Path(__file__).with_name("template")
+GENERATOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class RomInfo:
     game_code: str
     maker_code: str
     unit_code: int
+    device_capacity: int
     rom_size: int
     sha256: str
     arm9: Program
@@ -142,6 +144,7 @@ def inspect_rom(path: Path) -> RomInfo:
         game_code=game_code,
         maker_code=text(0x10, 2),
         unit_code=header[0x12],
+        device_capacity=header[0x14],
         rom_size=size,
         sha256=digest_file(path),
         arm9=arm9,
@@ -389,8 +392,15 @@ def translated_body(
 
 def translated_case(pc: int, word: int) -> list[str]:
     lines = [f"        case 0x{pc:08x}u:"]
-    lines.append(f"            if (word != 0x{word:08x}u)")
-    lines.append("                return nds_cpu_trap(cpu, NDS_RUN_CODE_MISMATCH, pc, word);")
+    lines.extend(
+        (
+            f"            if (word != 0x{word:08x}u) {{",
+            "                if (!nds_exec_arm(cpu, word, pc))",
+            "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, word);",
+            "                return NDS_RUN_BUDGET_EXHAUSTED;",
+            "            }",
+        )
+    )
     lines.extend(translated_body(pc, word))
     return lines
 
@@ -1145,8 +1155,11 @@ def write_translator(
                 pc,
                 [
                     f"        case 0x{pc:08x}u:",
-                    f"            if (half != 0x{half:04x}u)",
-                    "                return nds_cpu_trap(cpu, NDS_RUN_CODE_MISMATCH, pc, half);",
+                    f"            if (half != 0x{half:04x}u) {{",
+                    "                if (!nds_exec_thumb(cpu, half, pc))",
+                    "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, half);",
+                    "                return NDS_RUN_BUDGET_EXHAUSTED;",
+                    "            }",
                     f"            if (!nds_exec_thumb(cpu, 0x{half:04x}u, pc))",
                     "                return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, half);",
                     "            return NDS_RUN_BUDGET_EXHAUSTED;",
@@ -1167,7 +1180,9 @@ def write_translator(
         case_lines.extend(
             (
                 "            default:",
-                "                return nds_cpu_trap(cpu, NDS_RUN_CODE_MISMATCH, pc, half);",
+                "                if (!nds_exec_thumb(cpu, half, pc))",
+                "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, half);",
+                "                return NDS_RUN_BUDGET_EXHAUSTED;",
                 "            }",
             )
         )
@@ -1183,7 +1198,9 @@ def write_translator(
         case_lines.extend(
             (
                 "            default:",
-                "                return nds_cpu_trap(cpu, NDS_RUN_CODE_MISMATCH, pc, word);",
+                "                if (!nds_exec_arm(cpu, word, pc))",
+                "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, word);",
+                "                return NDS_RUN_BUDGET_EXHAUSTED;",
                 "            }",
             )
         )
@@ -1255,18 +1272,34 @@ def write_translator(
     lines.append("            switch (pc >> 12) {")
     for function, first, _ in ranges["thumb"]:
         lines.append(f"            case 0x{first >> 12:05x}u: result = {function}(cpu, pc, half); break;")
-    lines.extend(("            }", "        } else {", "            const uint32_t word = nds_read32(cpu, pc);",
-                  "            switch (pc >> 12) {"))
-    for function, first, _ in ranges["arm"]:
-        lines.append(f"            case 0x{first >> 12:05x}u: result = {function}(cpu, pc, word); break;")
-    lines.append("            }")
     lines.extend(
         (
+            "            }",
+            "            if (result == NDS_RUN_OUTSIDE_TRANSLATION) {",
+            "                if (!nds_exec_thumb(cpu, half, pc))",
+            "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, half);",
+            "                result = NDS_RUN_BUDGET_EXHAUSTED;",
+            "            }",
+            "        } else {",
+            "            const uint32_t word = nds_read32(cpu, pc);",
+            "            switch (pc >> 12) {",
+        )
+    )
+    for function, first, _ in ranges["arm"]:
+        lines.append(f"            case 0x{first >> 12:05x}u: result = {function}(cpu, pc, word); break;")
+    lines.extend(
+        (
+            "            }",
+            "            if (result == NDS_RUN_OUTSIDE_TRANSLATION) {",
+            "                if (!nds_exec_arm(cpu, word, pc))",
+            "                    return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, word);",
+            "                result = NDS_RUN_BUDGET_EXHAUSTED;",
+            "            }",
             "        }",
-            "        if (result == NDS_RUN_OUTSIDE_TRANSLATION)",
-            "            return nds_cpu_trap(cpu, result, pc, nds_read32(cpu, pc));",
             "        if (result != NDS_RUN_BUDGET_EXHAUSTED)",
             "            return result;",
+            "        if (cpu->reschedule)",
+            "            return NDS_RUN_BUDGET_EXHAUSTED;",
             "    }",
             "    return nds_cpu_trap(cpu, NDS_RUN_BUDGET_EXHAUSTED, cpu->r[15], nds_read32(cpu, cpu->r[15]));",
             "}",
@@ -1288,6 +1321,7 @@ def write_config_header(output: Path, info: RomInfo, compressed: bool, expanded_
                 f'#define NDS_ROM_TITLE "{safe_title}"',
                 f'#define NDS_GAME_CODE "{info.game_code}"',
                 f"#define NDS_UNIT_CODE {info.unit_code}u",
+                f"#define NDS_DEVICE_CAPACITY {info.device_capacity}u",
                 f"#define NDS_ROM_SIZE 0x{info.rom_size:08x}u",
                 f"#define NDS_ARM9_ROM_OFFSET 0x{info.arm9.rom_offset:08x}u",
                 f"#define NDS_ARM9_ENTRY 0x{info.arm9.entry_address:08x}u",
@@ -1309,14 +1343,15 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
     info = inspect_rom(rom_path)
     manifest_path = output / "project.json"
     previous_sha256: str | None = None
+    previous_manifest: dict[str, object] | None = None
     if manifest_path.exists() and not force:
-        old = json.loads(manifest_path.read_text(encoding="utf-8"))
-        previous_sha256 = old.get("rom", {}).get("sha256")
+        previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous_sha256 = previous_manifest.get("rom", {}).get("sha256")
         if previous_sha256 != info.sha256:
             raise ValueError(f"{output} belongs to another ROM; pass --force to replace generated files")
     elif manifest_path.exists():
-        old = json.loads(manifest_path.read_text(encoding="utf-8"))
-        previous_sha256 = old.get("rom", {}).get("sha256")
+        previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous_sha256 = previous_manifest.get("rom", {}).get("sha256")
 
     output.mkdir(parents=True, exist_ok=True)
     shutil.copytree(TEMPLATE_DIR, output, dirs_exist_ok=True)
@@ -1324,6 +1359,41 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
     rom_dir = output / "rom"
     generated.mkdir(exist_ok=True)
     rom_dir.mkdir(exist_ok=True)
+
+    # Keep create idempotent in the useful sense: after the ROM and generator
+    # are unchanged, avoid rescanning hundreds of thousands of instructions,
+    # extracting the ARM images, and rewriting hundreds of megabytes of
+    # generated C just to configure or rebuild the same project.  Template
+    # files were copied above, so runtime changes still propagate without
+    # invalidating the translation cache.
+    required_generated = (
+        "arm7_data.c",
+        "arm7_recomp.c",
+        "arm9_recomp.c",
+        "recomp_sources.cmake",
+        "rom_config.h",
+        "rom_data.c",
+    )
+    source_manifest = generated / "recomp_sources.cmake"
+    cached_sources = []
+    if source_manifest.is_file():
+        cached_sources = [
+            Path(line.strip())
+            for line in source_manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("generated/")
+        ]
+    cached_translation = (
+        not force
+        and previous_manifest is not None
+        and previous_manifest.get("generator_sha256") == GENERATOR_SHA256
+        and previous_manifest.get("translation", {}).get("instruction_limit") == instruction_limit
+        and all((generated / name).is_file() for name in required_generated)
+        and cached_sources
+        and all((output / source).is_file() for source in cached_sources)
+        and (rom_dir / "game.nds").is_file()
+    )
+    if cached_translation:
+        return info
 
     arm9 = read_segment(rom_path, info.arm9)
     arm7 = read_segment(rom_path, info.arm7)
@@ -1337,6 +1407,7 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
         write_bytes_if_changed(rom_dir / "arm9-expanded.bin", translation_image)
     elif (rom_dir / "arm9-expanded.bin").exists():
         (rom_dir / "arm9-expanded.bin").unlink()
+
     write_config_header(generated / "rom_config.h", info, compressed, len(translation_image))
     write_byte_array(generated / "rom_data.c", "nds_arm9_image", translation_image)
     write_byte_array(generated / "arm7_data.c", "nds_arm7_image", arm7)
@@ -1395,8 +1466,10 @@ def create_project(rom_path: Path, output: Path, instruction_limit: int, force: 
 
     manifest = {
         "format_version": 1,
+        "generator_sha256": GENERATOR_SHA256,
         "rom": asdict(info),
         "translation": {
+            "instruction_limit": instruction_limit,
             "arm9_reachable_instructions": arm_translated,
             "thumb_reachable_instructions": thumb_translated,
             "arm9_relocated_variants": aliases,
@@ -1426,12 +1499,18 @@ cmake --build build-linux
 ./build-linux/ndsrecomp --self-test
 ```
 
+Reuse the same build directory for incremental rebuilds. New projects group
+generated translation units in small unity files for clean builds. CMake also
+uses ccache or sccache automatically when installed; disable grouping with
+`-DNDSRECOMP_UNITY_BUILD=OFF` or tune `NDSRECOMP_UNITY_BATCH_SIZE` and
+`NDSRECOMP_UNITY_BATCH_KIB`.
+
 For Windows, configure with `cmake/mingw-w64.cmake`. The runtime presents its
-two-screen framebuffer through the easyGL2D-compatible host layer. The translator
-handles reachable ARM/Thumb code for both CPUs plus SDK relocations. Execution
-outside statically translated code stops with the exact address and opcode;
-overlays, audio, and the
-complete DS hardware models remain active implementation work.
+two-screen framebuffer through the easyGL2D-compatible host layer. The
+translator handles reachable ARM/Thumb code for both CPUs plus SDK relocations.
+Dynamically written ARM/Thumb code falls back to the same runtime instruction
+helpers, so ITCM handlers and overlay entry points remain executable. Audio and
+the complete DS hardware models remain active implementation work.
 """,
     )
     return info
@@ -1472,6 +1551,7 @@ def self_test() -> None:
         data[0:12] = b"RECOMP TEST\0"
         data[0x0C:0x10] = b"TST0"
         data[0x10:0x12] = b"00"
+        data[0x14] = 12
         struct.pack_into("<4I", data, 0x20, 0x200, 0x02000000, 0x02000000, 0x200)
         struct.pack_into("<4I", data, 0x30, 0x400, 0x03800000, 0x03800000, 0x100)
         struct.pack_into("<I", data, 0x70, 0x02000184)
@@ -1495,8 +1575,11 @@ def self_test() -> None:
         assert projects[1][0] == root / "output" / "second" / "native"
         manifest = json.loads((project / "project.json").read_text(encoding="utf-8"))
         assert info.game_code == "TST0"
+        assert info.device_capacity == 12
         assert info.arm9_build_info_offset == 0x100
         assert info.arm7_build_info_offset == 0x40
+        assert manifest["generator_sha256"] == GENERATOR_SHA256
+        assert manifest["translation"]["instruction_limit"] == 3
         assert manifest["translation"]["arm9_reachable_instructions"] == 3
         assert manifest["translation"]["thumb_reachable_instructions"] == 0
         assert manifest["translation"]["arm7_static_copies"] == [
@@ -1509,8 +1592,11 @@ def self_test() -> None:
         assert "nds_exec_data_processing" in generated
         assert "nds_branch_exchange" in generated
         runner = (project / "generated" / "arm9_recomp.c").read_text(encoding="utf-8")
-        assert "nds_exec_arm" not in runner
-        assert "return nds_cpu_trap(cpu, result, pc" in runner
+        assert "nds_exec_arm" in runner
+        assert "nds_exec_thumb" in runner
+        assert "return nds_cpu_trap(cpu, NDS_RUN_UNSUPPORTED, pc, word)" in runner
+        cached_projects = create_projects([rom], None, 3, False, root / "output")
+        assert cached_projects[0][0] == project
 
         literal_leaf = bytearray(0x80)
         struct.pack_into("<I", literal_leaf, 0, 0xE59F1058)

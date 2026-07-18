@@ -16,6 +16,13 @@ yet.
 Requirements: Python 3.10+, CMake 3.24+, Ninja, a C compiler, and internet
 access for CMake to fetch the pinned SDL3 source when SDL3 is not installed.
 
+Generated projects keep their CMake/Ninja object files, so rerunning the same
+build is incremental. New projects group generated translation units in small
+unity files for faster clean builds. If `ccache` or `sccache` is installed,
+CMake enables it automatically. Disable grouping with
+`-DNDSRECOMP_UNITY_BUILD=OFF`, or tune its file and size limits with
+`NDSRECOMP_UNITY_BATCH_SIZE` and `NDSRECOMP_UNITY_BATCH_KIB`.
+
 ```sh
 # Inspect any structurally valid .nds ROM.
 python3 ndsrecomp.py inspect game.nds

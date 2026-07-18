@@ -39,33 +39,48 @@ static unsigned initialized_obj_count(const NdsCpu *cpu, unsigned engine) {
 
 static bool run_steps(NdsCpu *cpu, NdsCpu *arm7, uint32_t count,
                       NdsRunResult *result, NdsRunResult *arm7_result) {
+    /* Run long slices until a cross-CPU IPC write requires an early yield. */
     for (uint32_t step = 0; step < count;) {
         uint32_t quantum = count - step;
-        if (quantum > 64u)
-            quantum = 64u;
+        if (quantum > 4096u)
+            quantum = 4096u;
         if (cpu->wait_cycles != 0u && cpu->wait_cycles < quantum)
             quantum = cpu->wait_cycles;
         if (arm7->wait_cycles != 0u && arm7->wait_cycles < quantum)
             quantum = arm7->wait_cycles;
-        step += quantum;
-        nds_tick(cpu, quantum * 2u);
-        nds_tick(arm7, quantum);
+        const bool cpu_waiting = cpu->wait_cycles != 0u;
+        const bool arm7_waiting = arm7->wait_cycles != 0u;
+        const uint64_t cpu_instructions = cpu->instructions_executed;
         nds_poll_interrupts(cpu);
-        if (cpu->wait_cycles != 0u) {
-            cpu->wait_cycles = cpu->wait_cycles > quantum ? cpu->wait_cycles - quantum : 0u;
-        } else if (!cpu->halted) {
+        if (!cpu_waiting && !cpu->halted) {
+            cpu->reschedule = false;
             *result = nds_run_arm9(cpu, quantum);
             if (*result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
         }
         nds_poll_interrupts(arm7);
-        if (arm7->wait_cycles != 0u) {
-            arm7->wait_cycles = arm7->wait_cycles > quantum ? arm7->wait_cycles - quantum : 0u;
-        } else if (!arm7->halted) {
+        if (!arm7_waiting && !arm7->halted) {
+            arm7->reschedule = false;
             *arm7_result = nds_run_arm7(arm7, quantum);
             if (*arm7_result != NDS_RUN_BUDGET_EXHAUSTED)
                 return false;
         }
+        if (!cpu_waiting) {
+            const uint64_t executed = cpu->instructions_executed - cpu_instructions;
+            if (executed != 0u && executed < quantum)
+                quantum = (uint32_t)executed;
+        }
+        nds_tick(cpu, quantum * 2u);
+        nds_tick(arm7, quantum);
+        if (cpu_waiting)
+            cpu->wait_cycles = cpu->wait_cycles > quantum ?
+                cpu->wait_cycles - quantum : 0u;
+        if (arm7_waiting)
+            arm7->wait_cycles = arm7->wait_cycles > quantum ?
+                arm7->wait_cycles - quantum : 0u;
+        nds_poll_interrupts(cpu);
+        nds_poll_interrupts(arm7);
+        step += quantum;
     }
     return true;
 }
@@ -76,6 +91,7 @@ int main(int argc, char **argv) {
     const char *rom_path = NULL;
     const char *dump_path = NULL;
     uint32_t step_limit = 0u;
+    uint32_t frame_limit = 0u;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--self-test") == 0) {
             self_test = true;
@@ -91,12 +107,25 @@ int main(int argc, char **argv) {
                 return 2;
             }
             step_limit = (uint32_t)parsed;
+        } else if (strcmp(argv[index], "--frames") == 0 && index + 1 < argc) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(argv[++index], &end, 10);
+            if (end == argv[index] || *end != '\0' || parsed == 0 ||
+                parsed > UINT32_MAX) {
+                fprintf(stderr, "invalid --frames value: %s\n", argv[index]);
+                return 2;
+            }
+            frame_limit = (uint32_t)parsed;
         } else if (strcmp(argv[index], "--dump-frame") == 0 && index + 1 < argc) {
             dump_path = argv[++index];
         } else {
-            fprintf(stderr, "usage: %s [--self-test] [--once] [--rom path] [--steps count] [--dump-frame path]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--self-test] [--once] [--frames count] [--rom path] [--steps count] [--dump-frame path]\n", argv[0]);
             return 2;
         }
+    }
+    if (one_frame && frame_limit != 0u) {
+        fputs("--once and --frames are mutually exclusive\n", stderr);
+        return 2;
     }
     if (step_limit == 0u)
         step_limit = self_test ? 10000000u : 560190u;
@@ -326,6 +355,8 @@ int main(int argc, char **argv) {
             frame_deadline = present_end;
         frame_deadline += NDS_FRAME_NS;
         previous_frame_start = frame_start;
+        if (frame_limit != 0u && stats.frame >= frame_limit)
+            break;
     }
     if (dump_path != NULL && !easygl2d_dump_framebuffer(dump_path))
         fprintf(stderr, "failed to dump framebuffer to %s\n", dump_path);
@@ -340,6 +371,9 @@ int main(int argc, char **argv) {
                nds_gpu_texture_format_count(cpu.gpu, format),
                nds_gpu_unique_texture_count(cpu.gpu, format));
     putchar('\n');
+    printf("gpu texture cache: uploads=%" PRIu64 " entries=%zu\n",
+           nds_gpu_texture_upload_count(cpu.gpu),
+           nds_gpu_texture_cache_count(cpu.gpu));
     nds_cpu_destroy(&arm7);
     nds_cpu_destroy(&cpu);
     easygl2d_shutdown();

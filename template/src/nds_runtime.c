@@ -36,6 +36,8 @@
 #define REG_IPCSYNC UINT32_C(0x04000180)
 #define REG_IPCFIFOCNT UINT32_C(0x04000184)
 #define REG_IPCFIFOSEND UINT32_C(0x04000188)
+#define REG_VRAMCNT UINT32_C(0x04000240)
+#define REG_1DOT_DEPTH UINT32_C(0x04000610)
 #define REG_AUXSPICNT UINT32_C(0x040001a0)
 #define REG_AUXSPIDATA UINT32_C(0x040001a2)
 #define REG_DISPSTAT UINT32_C(0x04000004)
@@ -411,12 +413,24 @@ static uint8_t vram_read8(const NdsCpu *cpu, uint32_t address) {
     return value;
 }
 
+static NdsGpu *gpu_for_cpu(NdsCpu *cpu) {
+    if (cpu->gpu != NULL)
+        return cpu->gpu;
+    return cpu->peer == NULL ? NULL : cpu->peer->gpu;
+}
+
 static void vram_write8(NdsCpu *cpu, uint32_t address, uint8_t value) {
+    bool changed = false;
     for (unsigned bank = 0; bank < 9u; ++bank) {
         uint32_t physical;
-        if (vram_bank_address(cpu, bank, address, &physical))
+        if (vram_bank_address(cpu, bank, address, &physical) &&
+            cpu->vram[physical] != value) {
             cpu->vram[physical] = value;
+            changed = true;
+        }
     }
+    if (changed)
+        nds_gpu_invalidate_textures(gpu_for_cpu(cpu));
 }
 
 static void run_dma(NdsCpu *cpu, uint32_t control_address, uint32_t control);
@@ -673,6 +687,15 @@ static uint8_t firmware_transfer(NdsCpu *cpu, uint8_t value) {
     return response;
 }
 
+static uint32_t cartridge_id(void) {
+    uint32_t id = UINT32_C(0x000000c2);
+    if (NDS_DEVICE_CAPACITY >= 3u && NDS_DEVICE_CAPACITY < 31u)
+        id |= ((UINT32_C(1) << (NDS_DEVICE_CAPACITY - 3u)) - 1u) << 8;
+    if (NDS_UNIT_CODE != 0u)
+        id |= UINT32_C(0x40000000);
+    return id;
+}
+
 static bool initialize_direct_boot(NdsCpu *cpu) {
     uint8_t header[0x170];
     if (fseek(cpu->rom_file, 0, SEEK_SET) != 0 ||
@@ -682,14 +705,7 @@ static bool initialize_direct_boot(NdsCpu *cpu) {
 
     /* Match the header/cart values the firmware leaves in main RAM.  SDK
        startup code uses these before it starts the game-specific boot. */
-    uint32_t cart_id = UINT32_C(0x000000c2);
-    if (NDS_ROM_SIZE >= UINT32_C(0x00100000) &&
-        NDS_ROM_SIZE <= UINT32_C(0x08000000))
-        cart_id |= ((NDS_ROM_SIZE >> 20) - 1u) << 8;
-    else if (NDS_ROM_SIZE < UINT32_C(0x10000000))
-        cart_id |= (UINT32_C(0x100) - (NDS_ROM_SIZE >> 28)) << 8;
-    if (NDS_UNIT_CODE != 0u)
-        cart_id |= UINT32_C(0x40000000);
+    const uint32_t cart_id = cartridge_id();
     uint16_t header_crc;
     uint16_t secure_crc;
     memcpy(&header_crc, header + 0x15e, sizeof(header_crc));
@@ -773,13 +789,6 @@ bool nds_cpu_init_arm9(NdsCpu *cpu, const char *rom_path) {
     }
     memcpy(cpu->main_ram + NDS_ARM9_RAM_ADDRESS - MAIN_BASE,
            nds_arm9_image, nds_arm9_image_size);
-    if (NDS_ARM7_RAM_ADDRESS < MAIN_BASE ||
-        NDS_ARM7_RAM_ADDRESS - MAIN_BASE + nds_arm7_image_size > MAIN_SIZE) {
-        nds_cpu_destroy(cpu);
-        return false;
-    }
-    memcpy(cpu->main_ram + NDS_ARM7_RAM_ADDRESS - MAIN_BASE,
-           nds_arm7_image, nds_arm7_image_size);
     cpu->io[REG_POSTFLG - IO_BASE] = 1u; /* Firmware has completed direct boot. */
     const uint16_t exmemcnt = UINT16_C(0xe880);
     const uint16_t power = UINT16_C(0x820f);
@@ -828,6 +837,19 @@ bool nds_cpu_init_arm7(NdsCpu *cpu, NdsCpu *arm9) {
     cpu->io = calloc(1, IO_SIZE);
     cpu->wram = calloc(1, ARM7_WRAM_SIZE);
     if (cpu->io == NULL || cpu->wram == NULL) {
+        nds_cpu_destroy(cpu);
+        return false;
+    }
+    if (NDS_ARM7_RAM_ADDRESS >= MAIN_BASE &&
+        NDS_ARM7_RAM_ADDRESS - MAIN_BASE + nds_arm7_image_size <= MAIN_SIZE) {
+        memcpy(cpu->main_ram + NDS_ARM7_RAM_ADDRESS - MAIN_BASE,
+               nds_arm7_image, nds_arm7_image_size);
+    } else if (NDS_ARM7_RAM_ADDRESS >= ARM7_WRAM_BASE &&
+               NDS_ARM7_RAM_ADDRESS - ARM7_WRAM_BASE + nds_arm7_image_size <=
+                   ARM7_WRAM_SIZE) {
+        memcpy(cpu->wram + NDS_ARM7_RAM_ADDRESS - ARM7_WRAM_BASE,
+               nds_arm7_image, nds_arm7_image_size);
+    } else {
         nds_cpu_destroy(cpu);
         return false;
     }
@@ -993,6 +1015,17 @@ void nds_cpu_destroy(NdsCpu *cpu) {
 }
 
 NdsRunResult nds_cpu_trap(NdsCpu *cpu, NdsRunResult result, uint32_t pc, uint32_t word) {
+    /* A statically translated instruction can be replaced by a ROM loader,
+       overlay, or self-modifying code.  Interpret that one changed opcode
+       instead of treating the normal dynamic-code path as a fatal trap. */
+    if (result == NDS_RUN_CODE_MISMATCH) {
+        const bool executed = nds_cpu_is_thumb(cpu) ?
+            nds_exec_thumb(cpu, (uint16_t)word, pc) :
+            nds_exec_arm(cpu, word, pc);
+        if (executed)
+            return NDS_RUN_BUDGET_EXHAUSTED;
+        result = NDS_RUN_UNSUPPORTED;
+    }
     cpu->trap_pc = pc;
     cpu->trap_word = word;
     return result;
@@ -1118,8 +1151,7 @@ uint32_t nds_read32(const NdsCpu *cpu, uint32_t address) {
         if (mutable->card_remaining != 0) {
             const uint8_t *command = mapped_const(mutable, REG_CARDCMD);
             if (command != NULL && command[0] == 0xb8u) {
-                const uint32_t megabytes = NDS_ROM_SIZE >> 20;
-                value = UINT32_C(0x000000c2) | ((megabytes - 1u) << 8);
+                value = cartridge_id();
             } else if (command != NULL && command[0] == 0xb7u && mutable->rom_file != NULL) {
                 FILE *rom = mutable->rom_file;
                 uint8_t bytes[4] = {0xff, 0xff, 0xff, 0xff};
@@ -1277,6 +1309,11 @@ void nds_write8(NdsCpu *cpu, uint32_t address, uint8_t value) {
         else
             *data = value;
     }
+    if (address >= REG_VRAMCNT && address < REG_VRAMCNT + 9u)
+        nds_gpu_invalidate_textures(gpu_for_cpu(cpu));
+    if (cpu->cpu_id == 9u && address >= REG_1DOT_DEPTH &&
+        address < REG_1DOT_DEPTH + 2u)
+        nds_gpu_set_1dot_depth(cpu->gpu, nds_read16(cpu, REG_1DOT_DEPTH));
     if (address == SDK_PROBE_MAILBOX) {
         uint8_t *mailbox = mapped(cpu, SDK_PROBE_MAILBOX);
         if (mailbox != NULL) {
@@ -1304,6 +1341,7 @@ void nds_write16(NdsCpu *cpu, uint32_t address, uint16_t value) {
     if (address == REG_VCOUNT)
         return;
     if (address == REG_IPCSYNC) {
+        cpu->reschedule = true;
         const uint16_t previous = nds_read16(cpu, address);
         value = (uint16_t)((value & 0x6f00u) | (previous & 15u));
         if (cpu->peer != NULL) {
@@ -1355,7 +1393,11 @@ void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value) {
         nds_gpu_write_status(cpu->gpu, value);
         return;
     }
-    if (cpu->cpu_id == 9u && aligned == REG_GXFIFO) {
+    /* GXFIFO is mirrored through 0x0400043f.  ARM9 display-list code uses
+       STRD/STM against those mirrors to submit one unpacked command plus its
+       parameters. */
+    if (cpu->cpu_id == 9u && aligned >= REG_GXFIFO &&
+        aligned < REG_GXFIFO + 0x40u) {
         nds_gpu_write32(cpu->gpu, value);
         return;
     }
@@ -1405,6 +1447,7 @@ void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value) {
             run_dma(cpu, aligned, value);
     }
     if (aligned == REG_IPCFIFOSEND) {
+        cpu->reschedule = true;
         cpu->fifo_sent++;
         cpu->fifo_word = value;
         NdsCpu *receiver = cpu->peer;
@@ -1482,6 +1525,66 @@ bool nds_finish_interrupt(NdsCpu *cpu) {
                                        : return_address & ~3u;
     cpu->irq_completed++;
     return true;
+}
+
+bool nds_exec_arm(NdsCpu *cpu, uint32_t word, uint32_t pc) {
+    const uint32_t next = pc + 4u;
+    if ((word & 0xfe000000u) == 0xfa000000u) {
+        const int32_t displacement = sign_extend32(
+            ((word & 0x00ffffffu) << 2) | ((word >> 23) & 2u), 26
+        );
+        nds_branch_link_exchange_immediate(
+            cpu, (uint32_t)(pc + 8u + displacement), next
+        );
+        return true;
+    }
+    const unsigned condition = word >> 28;
+    if (condition == 0xfu)
+        return false;
+    if (!nds_condition(cpu, condition)) {
+        cpu->r[15] = next;
+        return true;
+    }
+    if ((word & 0x0ffffff0u) == 0x012fff10u)
+        return nds_branch_exchange(cpu, word & 15u, false, pc);
+    if ((word & 0x0ffffff0u) == 0x012fff30u)
+        return nds_branch_exchange(cpu, word & 15u, true, pc);
+    if ((word & 0x0e000000u) == 0x0a000000u) {
+        if (word & (1u << 24))
+            cpu->r[14] = next;
+        cpu->r[15] = (uint32_t)(pc + 8u +
+                                 sign_extend32(word & 0x00ffffffu, 24) * 4);
+        return true;
+    }
+    bool handled;
+    if ((word & 0x0fc000f0u) == 0x00000090u)
+        handled = nds_exec_multiply(cpu, word, pc);
+    else if ((word & 0x0f8000f0u) == 0x00800090u)
+        handled = nds_exec_long_multiply(cpu, word, pc);
+    else if ((word & 0x0e000090u) == 0x00000090u)
+        handled = nds_exec_half_transfer(cpu, word, pc);
+    else if ((word & 0x0fff0ff0u) == 0x016f0f10u) {
+        nds_exec_clz(cpu, word, pc);
+        handled = true;
+    } else if ((word & 0x0fbf0fffu) == 0x010f0000u ||
+               (word & 0x0fb0fff0u) == 0x0120f000u ||
+               (word & 0x0fb0f000u) == 0x0320f000u)
+        handled = nds_exec_status(cpu, word, pc);
+    else if ((word & 0x0c000000u) == 0x00000000u)
+        handled = nds_exec_data_processing(cpu, word, pc);
+    else if ((word & 0x0c000000u) == 0x04000000u)
+        handled = nds_exec_single_transfer(cpu, word, pc);
+    else if ((word & 0x0e000000u) == 0x08000000u)
+        handled = nds_exec_block_transfer(cpu, word, pc);
+    else if ((word & 0x0f000010u) == 0x0e000010u)
+        handled = nds_exec_coprocessor(cpu, word, pc);
+    else if ((word & 0x0f000000u) == 0x0f000000u)
+        handled = nds_exec_swi(cpu, word & 0x00ffffffu, pc, next);
+    else
+        handled = false;
+    if (handled && cpu->r[15] == pc)
+        cpu->r[15] = next;
+    return handled;
 }
 
 static void run_dma(NdsCpu *cpu, uint32_t control_address, uint32_t control) {

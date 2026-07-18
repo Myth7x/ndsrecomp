@@ -739,14 +739,17 @@ void nds_video_render(const NdsCpu *cpu) {
     const int main_y = main_upper ? 0 : 192;
     const int sub_y = main_upper ? 192 : 0;
     const uint32_t main_display = io32(cpu, 0u);
-    const bool main_has_3d = (power & (1u << 3)) != 0u &&
+    /* POWCNT1 bit 2 enables the 3D rendering engine; bit 3 only enables
+       geometry command processing.  DISPCNT bit 3 selects 3D for BG0. */
+    const bool main_has_3d = (power & (1u << 2)) != 0u &&
                              (main_display & 8u) != 0u &&
                              (main_display & (1u << 7)) == 0u;
     if (main_has_3d) {
-        render_engine(cpu, 0u, main_y, true, 3, 1);
+        const int bg0_priority = io16(cpu, 8u) & 3u;
+        render_engine(cpu, 0u, main_y, true, 3, bg0_priority + 1);
         nds_gpu_render(cpu, main_y);
         video_mark_3d(main_y);
-        render_engine(cpu, 0u, main_y, false, 0, 0);
+        render_engine(cpu, 0u, main_y, false, bg0_priority, 0);
     } else {
         render_engine(cpu, 0u, main_y, true, 3, 0);
     }

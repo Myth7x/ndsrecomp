@@ -41,6 +41,7 @@ typedef struct NdsCpuTag {
     uint32_t fifo_received;
     uint32_t wait_cycles;
     uint32_t tick_count;
+    bool reschedule;
     uint32_t timer_accum[4];
     uint16_t timer_reload[4];
     uint32_t last_irq_handler;
@@ -107,6 +108,7 @@ void nds_write16(NdsCpu *cpu, uint32_t address, uint16_t value);
 void nds_write32(NdsCpu *cpu, uint32_t address, uint32_t value);
 bool nds_branch_exchange(NdsCpu *cpu, unsigned rm, bool link, uint32_t pc);
 void nds_branch_link_exchange_immediate(NdsCpu *cpu, uint32_t target, uint32_t return_address);
+bool nds_exec_arm(NdsCpu *cpu, uint32_t word, uint32_t pc);
 bool nds_exec_status(NdsCpu *cpu, uint32_t word, uint32_t pc);
 void nds_exec_clz(NdsCpu *cpu, uint32_t word, uint32_t pc);
 bool nds_exec_data_processing(NdsCpu *cpu, uint32_t word, uint32_t pc);

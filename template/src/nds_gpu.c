@@ -37,6 +37,7 @@ typedef struct {
     uint32_t texture;
     uint32_t palette;
     GLuint name;
+    uint64_t generation;
     bool ready;
 } GpuTextureCacheEntry;
 
@@ -80,6 +81,12 @@ struct NdsGpuTag {
     GpuTriangle *pending_triangles;
     size_t pending_triangle_count;
     bool swap_pending;
+    GpuTextureCacheEntry *texture_cache;
+    size_t texture_cache_count;
+    size_t texture_cache_capacity;
+    uint64_t texture_generation;
+    uint64_t texture_upload_count;
+    uint16_t one_dot_depth;
     size_t vertex_count;
     uint8_t commands[GPU_CMD_QUEUE];
     unsigned command_head;
@@ -320,6 +327,35 @@ static void transform_direction(const NdsGpu *gpu, float input_x,
     }
 }
 
+static void update_texcoord_from_texcoord(NdsGpu *gpu) {
+    if (((gpu->texture >> 30) & 3u) != 1u) {
+        gpu->texcoord[0] = gpu->raw_texcoord[0];
+        gpu->texcoord[1] = gpu->raw_texcoord[1];
+        return;
+    }
+    const float *matrix = gpu->matrix[3];
+    gpu->texcoord[0] = gpu->raw_texcoord[0] * matrix[0] +
+                       gpu->raw_texcoord[1] * matrix[4] +
+                       (matrix[8] + matrix[12]) / 16.0f;
+    gpu->texcoord[1] = gpu->raw_texcoord[0] * matrix[1] +
+                       gpu->raw_texcoord[1] * matrix[5] +
+                       (matrix[9] + matrix[13]) / 16.0f;
+}
+
+static void update_texcoord_from_normal(NdsGpu *gpu) {
+    if (((gpu->texture >> 30) & 3u) != 2u)
+        return;
+    const float *matrix = gpu->matrix[3];
+    gpu->texcoord[0] = gpu->raw_texcoord[0] +
+                       gpu->normal[0] * matrix[0] +
+                       gpu->normal[1] * matrix[4] +
+                       gpu->normal[2] * matrix[8];
+    gpu->texcoord[1] = gpu->raw_texcoord[1] +
+                       gpu->normal[0] * matrix[1] +
+                       gpu->normal[1] * matrix[5] +
+                       gpu->normal[2] * matrix[9];
+}
+
 static uint32_t fixed_result(float value) {
     const double scaled = (double)value * 4096.0;
     if (scaled > 2147483647.0)
@@ -356,13 +392,14 @@ static unsigned command_parameters(uint8_t command) {
 }
 
 static void matrix_load_4x3(float *matrix, const uint32_t *parameters) {
-    /* GX payloads use the DS row-oriented layout.  The renderer stores
-     * matrices column-major for its column-vector math. */
+    /* GX payloads are row-oriented and the DS composes them as row-vector
+     * transforms.  The renderer uses column-vector math, so store the
+     * transpose in its column-major representation. */
     matrix_identity(matrix);
     for (unsigned row = 0; row < 3u; ++row)
         for (unsigned column = 0; column < 3u; ++column)
             matrix[column * 4u + row] =
-                fixed20(parameters[row * 3u + column]);
+                fixed20(parameters[column * 3u + row]);
     matrix[12] = fixed20(parameters[9]);
     matrix[13] = fixed20(parameters[10]);
     matrix[14] = fixed20(parameters[11]);
@@ -372,7 +409,7 @@ static void matrix_load_4x4(float *matrix, const uint32_t *parameters) {
     for (unsigned row = 0; row < 4u; ++row)
         for (unsigned column = 0; column < 4u; ++column)
             matrix[column * 4u + row] =
-                fixed20(parameters[row * 4u + column]);
+                fixed20(parameters[column * 4u + row]);
 }
 
 static void transform_vertex(const NdsGpu *gpu, GpuVertex *vertex) {
@@ -413,34 +450,16 @@ static void transform_vertex(const NdsGpu *gpu, GpuVertex *vertex) {
         gpu->vertex[0], gpu->vertex[1], gpu->vertex[2], 1.0f
     };
     const unsigned texture_mode = (gpu->texture >> 30) & 3u;
-    if (texture_mode == 2u) {
-        const float *matrix = gpu->matrix[3];
-        vertex->u = gpu->raw_texcoord[0] +
-                    (gpu->normal[0] * matrix[0] +
-                     gpu->normal[1] * matrix[4] +
-                     gpu->normal[2] * matrix[8]) / 16.0f;
-        vertex->v = gpu->raw_texcoord[1] +
-                    (gpu->normal[0] * matrix[1] +
-                     gpu->normal[1] * matrix[5] +
-                     gpu->normal[2] * matrix[9]) / 16.0f;
-    } else if (texture_mode == 3u) {
+    if (texture_mode == 3u) {
         const float *matrix = gpu->matrix[3];
         vertex->u = gpu->raw_texcoord[0] +
                     (texture_input[0] * matrix[0] +
                      texture_input[1] * matrix[4] +
-                     texture_input[2] * matrix[8]) * 16.0f;
+                     texture_input[2] * matrix[8]);
         vertex->v = gpu->raw_texcoord[1] +
                     (texture_input[0] * matrix[1] +
                      texture_input[1] * matrix[5] +
-                     texture_input[2] * matrix[9]) * 16.0f;
-    } else if (texture_mode == 1u) {
-        const float *matrix = gpu->matrix[3];
-        vertex->u = gpu->raw_texcoord[0] * matrix[0] +
-                    gpu->raw_texcoord[1] * matrix[4] +
-                    matrix[8] + matrix[12];
-        vertex->v = gpu->raw_texcoord[0] * matrix[1] +
-                    gpu->raw_texcoord[1] * matrix[5] +
-                    matrix[9] + matrix[13];
+                     texture_input[2] * matrix[9]);
     } else {
         vertex->u = gpu->texcoord[0];
         vertex->v = gpu->texcoord[1];
@@ -498,18 +517,21 @@ static bool triangle_is_translucent(const GpuTriangle *triangle) {
     return format == 1u || format == 6u || (alpha > 0u && alpha < 31u);
 }
 
+static int compare_triangle_sort_key(const void *left, const void *right) {
+    const GpuTriangle *first = left;
+    const GpuTriangle *second = right;
+    if (first->sort_key < second->sort_key)
+        return -1;
+    if (first->sort_key > second->sort_key)
+        return 1;
+    return 0;
+}
+
 static void sort_triangles(GpuTriangle *triangles, size_t count,
                            size_t opaque_count) {
-    for (size_t index = 1u; index < opaque_count; ++index) {
-        GpuTriangle value = triangles[index];
-        size_t position = index;
-        while (position != 0u &&
-               triangles[position - 1u].sort_key > value.sort_key) {
-            triangles[position] = triangles[position - 1u];
-            --position;
-        }
-        triangles[position] = value;
-    }
+    if (triangles != NULL && opaque_count > 1u)
+        qsort(triangles, opaque_count, sizeof(*triangles),
+              compare_triangle_sort_key);
     (void)count;
 }
 
@@ -634,6 +656,31 @@ static bool append_triangle(NdsGpu *gpu, const GpuVertex *a,
     }
     if (count < 3u)
         return true;
+    if ((gpu->polygon & (1u << 13)) == 0u) {
+        const float threshold = (float)gpu->one_dot_depth / 8.0f;
+        const bool too_far = a->clip[3] > threshold &&
+                             b->clip[3] > threshold &&
+                             c->clip[3] > threshold;
+        GpuVertex projected[3] = {*a, *b, *c};
+        for (unsigned vertex = 0; vertex < 3u; ++vertex)
+            update_viewport_vertex(gpu, &projected[vertex]);
+        float min_x = projected[0].x;
+        float max_x = min_x;
+        float min_y = projected[0].y;
+        float max_y = min_y;
+        for (unsigned vertex = 1u; vertex < 3u; ++vertex) {
+            if (projected[vertex].x < min_x) min_x = projected[vertex].x;
+            if (projected[vertex].x > max_x) max_x = projected[vertex].x;
+            if (projected[vertex].y < min_y) min_y = projected[vertex].y;
+            if (projected[vertex].y > max_y) max_y = projected[vertex].y;
+        }
+        const bool zero_width = floorf((min_x + 1.0f) * 128.0f) ==
+                                floorf((max_x + 1.0f) * 128.0f);
+        const bool zero_height = floorf((1.0f - max_y) * 96.0f) ==
+                                 floorf((1.0f - min_y) * 96.0f);
+        if (too_far && zero_width && zero_height)
+            return true;
+    }
     uint64_t maximum_w = 0u;
     for (unsigned vertex = 0; vertex < count; ++vertex) {
         int64_t raw_w = llround((double)input[vertex].clip[3] * 4096.0);
@@ -814,8 +861,9 @@ static bool upload_texture(const NdsCpu *cpu, const GpuTriangle *triangle,
 
 static void toon_color(const NdsCpu *cpu, const GpuVertex *vertex,
                        float color[3]) {
-    const unsigned level = (unsigned)(vertex->r * 63.0f);
-    const unsigned index = (level >> 1) > 15u ? 15u : level >> 1;
+    /* The red component selects all 32 entries of the toon table. */
+    const unsigned index = (unsigned)(vertex->r * 31.0f) > 31u ?
+        31u : (unsigned)(vertex->r * 31.0f);
     const uint16_t value = nds_read16(cpu, UINT32_C(0x04000380) + index * 2u);
     const unsigned red = value & 31u;
     const unsigned green = (value >> 5) & 31u;
@@ -850,14 +898,6 @@ static bool fullscreen_composite(const GpuTriangle *triangle) {
 }
 
 static void emit_vertex(NdsGpu *gpu) {
-    /* POLYGON_ATTR is latched when a polygon starts.  It is normally sent
-     * before BEGIN_VTXS, but display lists may change it between polygons in
-     * one BEGIN/END block (especially when switching textures/materials). */
-    if (gpu->in_primitive && gpu->strip_count == 0u &&
-        gpu->polygon_pending_valid) {
-        gpu->polygon = gpu->polygon_pending;
-        gpu->polygon_pending_valid = false;
-    }
     GpuVertex vertex;
     transform_vertex(gpu, &vertex);
     if (!gpu->in_primitive)
@@ -979,7 +1019,7 @@ static void execute_command(NdsGpu *gpu) {
         for (unsigned row = 0; row < 3u; ++row)
             for (unsigned column = 0; column < 3u; ++column)
                 transform[column * 4u + row] =
-                    fixed20(p[row * 3u + column]);
+                    fixed20(p[column * 3u + row]);
         matrix_apply_current(gpu, transform, false);
         break;
     }
@@ -1010,12 +1050,12 @@ static void execute_command(NdsGpu *gpu) {
         transform_direction(gpu, fixed9(p[0]), fixed9(p[0] >> 10),
                             fixed9(p[0] >> 20), gpu->normal);
         update_lighting(gpu);
+        update_texcoord_from_normal(gpu);
         break;
     case 0x22:
         gpu->raw_texcoord[0] = (float)(int16_t)(p[0] & 0xffffu) / 16.0f;
         gpu->raw_texcoord[1] = (float)(int16_t)(p[0] >> 16) / 16.0f;
-        gpu->texcoord[0] = gpu->raw_texcoord[0];
-        gpu->texcoord[1] = gpu->raw_texcoord[1];
+        update_texcoord_from_texcoord(gpu);
         break;
     case 0x23:
         gpu->vertex[0] = fixed16(p[0]);
@@ -1093,7 +1133,7 @@ static void execute_command(NdsGpu *gpu) {
             gpu->polygon = gpu->polygon_pending;
             gpu->polygon_pending_valid = false;
         }
-        gpu->primitive = p[0] & 7u;
+        gpu->primitive = p[0] & 3u;
         gpu->in_primitive = true;
         gpu->strip_count = 0u;
         gpu->strip_parity = 0u;
@@ -1181,6 +1221,7 @@ NdsGpu *nds_gpu_create(void) {
     gpu->diffuse[0] = gpu->diffuse[1] = gpu->diffuse[2] = 1.0f;
     gpu->ambient[0] = gpu->ambient[1] = gpu->ambient[2] = 1.0f;
     gpu->viewport = 0xbfff00ffu;
+    gpu->texture_generation = 1u;
     return gpu;
 }
 
@@ -1190,11 +1231,41 @@ void nds_gpu_destroy(NdsGpu *gpu) {
     free(gpu->triangles);
     free(gpu->render_triangles);
     free(gpu->visible_triangles);
+    free(gpu->texture_cache);
     free(gpu);
 }
 
 void nds_gpu_begin_frame(NdsGpu *gpu) {
     (void)gpu;
+}
+
+void nds_gpu_invalidate_textures(NdsGpu *gpu) {
+    if (gpu == NULL)
+        return;
+    ++gpu->texture_generation;
+    if (gpu->texture_generation == 0u)
+        gpu->texture_generation = 1u;
+}
+
+void nds_gpu_set_1dot_depth(NdsGpu *gpu, uint16_t depth) {
+    if (gpu != NULL)
+        gpu->one_dot_depth = depth & 0x7fffu;
+}
+
+static void prune_texture_cache(NdsGpu *gpu) {
+    size_t write = 0u;
+    for (size_t index = 0; index < gpu->texture_cache_count; ++index) {
+        GpuTextureCacheEntry *entry = &gpu->texture_cache[index];
+        if (entry->generation != gpu->texture_generation) {
+            if (entry->name != 0u)
+                glDeleteTextures(1, &entry->name);
+            continue;
+        }
+        if (write != index)
+            gpu->texture_cache[write] = *entry;
+        ++write;
+    }
+    gpu->texture_cache_count = write;
 }
 
 void nds_gpu_vblank(NdsGpu *gpu) {
@@ -1288,6 +1359,8 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
     const NdsGpu *gpu = cpu == NULL ? NULL : cpu->gpu;
     if (gpu == NULL || !easygl2d_gl_begin())
         return;
+    NdsGpu *cache_gpu = (NdsGpu *)gpu;
+    prune_texture_cache(cache_gpu);
     glViewport(0, 0, 256, 192);
     const uint16_t display3d = nds_read16(cpu, UINT32_C(0x04000060));
     const uint32_t clear_color = nds_read32(cpu, UINT32_C(0x04000350));
@@ -1330,10 +1403,6 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
     GLint stencil_bits = 0;
     glGetIntegerv(GL_STENCIL_BITS, &stencil_bits);
     has_shadow_mask = has_shadow_mask && stencil_bits != 0;
-    GpuTextureCacheEntry *texture_cache = calloc(
-        gpu->visible_triangle_count == 0u ? 1u : gpu->visible_triangle_count,
-        sizeof(*texture_cache));
-    size_t texture_cache_count = 0u;
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
@@ -1348,7 +1417,11 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
                  (float)clear_g / 63.0f,
                  (float)clear_b / 63.0f,
                  (float)((clear_color >> 16) & 31u) / 31.0f);
-    glClearDepth((double)(clear_depth & 0x7fffu) / 32767.0);
+    /* CLEAR_DEPTH expands to X*0x200 plus the final 0x1ff only for X=0x7fff. */
+    const uint32_t clear_depth24 =
+        ((uint32_t)(clear_depth & 0x7fffu) << 9) |
+        (clear_depth == 0x7fffu ? 0x1ffu : 0u);
+    glClearDepth((double)clear_depth24 / 16777215.0);
     if (has_shadow_mask) {
         glClearStencil(0);
         glStencilMask(0xff);
@@ -1403,25 +1476,41 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
         const bool texture_alpha = textured &&
             (format == 1u || format == 5u || format == 6u || format == 7u ||
              (triangle->texture & (1u << 29)) != 0u);
-        bool texture_ready = false;
-        if (textured && texture_cache != NULL) {
+        GpuTextureCacheEntry *texture_entry = NULL;
+        if (textured) {
             size_t cache_index = 0u;
-            while (cache_index < texture_cache_count &&
-                   (texture_cache[cache_index].texture != triangle->texture ||
-                    texture_cache[cache_index].palette != triangle->palette))
+            while (cache_index < cache_gpu->texture_cache_count &&
+                   (cache_gpu->texture_cache[cache_index].texture != triangle->texture ||
+                    cache_gpu->texture_cache[cache_index].palette != triangle->palette))
                 ++cache_index;
-            if (cache_index == texture_cache_count) {
-                GpuTextureCacheEntry *entry = &texture_cache[texture_cache_count++];
+            if (cache_index == cache_gpu->texture_cache_count &&
+                cache_gpu->texture_cache_count == cache_gpu->texture_cache_capacity) {
+                size_t capacity = cache_gpu->texture_cache_capacity == 0u ? 32u :
+                                   cache_gpu->texture_cache_capacity * 2u;
+                GpuTextureCacheEntry *entries = realloc(
+                    cache_gpu->texture_cache, capacity * sizeof(*entries));
+                if (entries != NULL) {
+                    cache_gpu->texture_cache = entries;
+                    cache_gpu->texture_cache_capacity = capacity;
+                }
+            }
+            if (cache_index == cache_gpu->texture_cache_count &&
+                cache_gpu->texture_cache_count < cache_gpu->texture_cache_capacity) {
+                GpuTextureCacheEntry *entry =
+                    &cache_gpu->texture_cache[cache_gpu->texture_cache_count++];
                 entry->texture = triangle->texture;
                 entry->palette = triangle->palette;
+                entry->generation = cache_gpu->texture_generation;
                 glGenTextures(1, &entry->name);
                 entry->ready = upload_texture(cpu, triangle, entry->name);
+                cache_gpu->texture_upload_count++;
             }
-            texture_ready = texture_cache[cache_index].ready;
-            if (texture_ready)
-                glBindTexture(GL_TEXTURE_2D, texture_cache[cache_index].name);
+            if (cache_index < cache_gpu->texture_cache_count)
+                texture_entry = &cache_gpu->texture_cache[cache_index];
         }
-        textured = textured && texture_ready;
+        textured = textured && texture_entry != NULL && texture_entry->ready;
+        if (textured)
+            glBindTexture(GL_TEXTURE_2D, texture_entry->name);
         if (textured)
             glEnable(GL_TEXTURE_2D);
         else
@@ -1452,7 +1541,9 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
             glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_FALSE);
         } else {
-            glDepthFunc(rear_plane ? GL_ALWAYS : GL_LEQUAL);
+            const bool equal_depth = (triangle->polygon & (1u << 14)) != 0u;
+            glDepthFunc(rear_plane ? GL_ALWAYS :
+                        (equal_depth ? GL_EQUAL : GL_LESS));
             glDepthMask(!rear_plane && (polygon_alpha == 31u ||
                         (triangle->polygon & (1u << 11)) != 0u));
         }
@@ -1539,9 +1630,6 @@ void nds_gpu_render(const NdsCpu *cpu, int screen_y) {
             glEnd();
         }
     }
-    for (size_t index = 0u; index < texture_cache_count; ++index)
-        glDeleteTextures(1, &texture_cache[index].name);
-    free(texture_cache);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_FOG);
@@ -1610,6 +1698,14 @@ size_t nds_gpu_unique_texture_count(const NdsGpu *gpu, unsigned format) {
         count += previous == index;
     }
     return count;
+}
+
+uint64_t nds_gpu_texture_upload_count(const NdsGpu *gpu) {
+    return gpu == NULL ? 0u : gpu->texture_upload_count;
+}
+
+size_t nds_gpu_texture_cache_count(const NdsGpu *gpu) {
+    return gpu == NULL ? 0u : gpu->texture_cache_count;
 }
 
 uint32_t nds_gpu_read_status(const NdsGpu *gpu) {
